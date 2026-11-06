@@ -44,7 +44,11 @@ export interface RunStore {
   close?(): Promise<void>;
 }
 
-export type RunStoreErrorCode = "not_found" | "out_of_order" | "already_approved" | "run_not_active";
+export type RunStoreErrorCode =
+  | "not_found"
+  | "out_of_order"
+  | "already_approved"
+  | "run_not_active";
 
 export class RunStoreError extends Error {
   readonly code: RunStoreErrorCode;
