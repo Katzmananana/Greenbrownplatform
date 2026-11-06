@@ -8,7 +8,7 @@ Package map:
 
 | Path | Name | Now |
 |---|---|---|
-| `apps/gateway` | `@gb/gateway` | Express: `GET /health`, `POST /mcp` stub, credit hard-stop middleware |
+| `apps/gateway` | `@gb/gateway` | Express: `GET /health`, `POST /mcp` MCP server (`create_run`/`get_run`/`approve`, bearer auth), credit hard-stop middleware |
 | `apps/orchestrator` | `@gb/orchestrator` | Health + `POST /internal/fix-loop/next` stub |
 | `apps/web` | `@gb/web` | Admin health page stub |
 | `apps/worker` | `@gb/worker` | BullMQ `jobs` consumer stub (no-ops without `REDIS_URL`) |
@@ -16,6 +16,7 @@ Package map:
 | `packages/credits` | `@gb/credits` | Caps, ledger, 80% alert, `CreditHardStopError` |
 | `packages/gates` | `@gb/gates` | §7 gate list + `decideFixLoop` |
 | `db/migrations/001_init.sql` | — | `org_config`, `credit_ledger`, `runs`, `approvals`, `deployments` |
+| `db/migrations/002_requests.sql` | — | `requests` (free-text request for MCP `create_run`) — **not yet applied in lab** |
 | `.github/workflows/ci.yml` | — | All §7 gates, all blocking |
 | `.github/workflows/promote.yml` | — | CP3 `environment: production` + rollback-on-health-failure |
 
@@ -47,7 +48,12 @@ Tear-down = delete that Railway project.
 5. ~~Configure GitHub~~ **done** (2026-11-06):
    - Branch protection on `main` (classic): require PR + require status checks; add `gates-required` after first CI run if it was missing from the search.
    - Environment `Production` with required reviewer Katzmananana; admin bypass off.
-6. Next: Claude Code against this repo (Avner has credits) and/or approve bootstrap + product work (MCP tools, orchestrator state machine, coding agent).
+6. **MCP milestone — code done on `feat/gateway-mcp-minimal`, not merged/deployed** (2026-11-06). `POST /mcp` speaks JSON-RPC MCP (`initialize`, `ping`, `tools/list`, `tools/call`) with tools `create_run`, `get_run`, `approve` (CP1→CP2→CP3 in order; CP3 → `succeeded`). Details and curl examples in README "Gateway MCP". Before it works end-to-end in lab:
+   - Install the driver: `pnpm --filter @gb/gateway add pg` and commit the lockfile. Until then the gateway logs a warning and uses the in-memory store even with `DATABASE_URL` set (runs are lost on redeploy). `/health` shows `runStore`.
+   - Apply `db/migrations/002_requests.sql` to lab Postgres (idempotent).
+   - Set `GB_MCP_TOKEN` on the gateway service. Lab runs with `NODE_ENV=production`, so `/mcp` returns 503 without it.
+   - Open the PR, merge, and let Railway redeploy.
+7. Next after MCP: orchestrator state machine (consume runs, drive Planner → coder → gates), real CP auth (JWT / `auth_time`), coding agent.
 
 ## Local verification
 
