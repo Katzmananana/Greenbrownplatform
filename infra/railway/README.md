@@ -15,9 +15,9 @@ Lab project already exists. Tear-down = delete this Railway project (not individ
 | Service | Kind | Public? | Health | Start (after build) | Notes |
 |---|---|---|---|---|---|
 | `gateway` | web, Node 22 | yes | `GET /health` (also `/healthz`) | `pnpm --filter @gb/gateway start` | REST + MCP stub + credit hard-stop hook |
-| `orchestrator` | web, Node 22 | private | `GET /health` | `pnpm --filter @gb/orchestrator start` | fix-loop stub; later: `releaseCommand` = migrate |
+| `orchestrator` | web, Node 22 | private | `GET /health` | `pnpm --filter @gb/orchestrator start` | run lifecycle loop; needs `DATABASE_URL`, uses `REDIS_URL` for BullMQ. Apply `db/migrations/003_run_phase.sql` |
 | `web` | web, Node 22 | yes | `GET /health` | `pnpm --filter @gb/web start` | admin stub page |
-| `worker` | worker, Node 22 | private | `GET /health` | `pnpm --filter @gb/worker start` | BullMQ consumer stub (needs `REDIS_URL`) |
+| `worker` | worker, Node 22 | private | `GET /health` | `pnpm --filter @gb/worker start` | BullMQ `jobs` consumer (`plan`/`code`/`fix`); needs `REDIS_URL` |
 | `Postgres` | plugin | private | n/a | n/a | injects `DATABASE_URL` — blocked on Free until Hobby |
 | `Redis` | plugin | private | n/a | n/a | injects `REDIS_URL` — already present |
 

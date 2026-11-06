@@ -2,7 +2,17 @@ import express, { type Express } from "express";
 import { defaultLabOrgConfig } from "@gb/credits";
 import { decideFixLoop } from "@gb/gates";
 
-export function createApp(): Express {
+export interface LoopStatus {
+  /** `off` when DATABASE_URL is unset; `inline` when Redis is unset; `bullmq` when both are set. */
+  queue: "off" | "inline" | "bullmq";
+  database: boolean;
+  redis: boolean;
+  pollMs: number;
+  lastTickAt: string | null;
+  lastError: string | null;
+}
+
+export function createApp(status: LoopStatus): Express {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "1mb" }));
@@ -12,6 +22,13 @@ export function createApp(): Express {
       status: "ok",
       service: "orchestrator",
       platform: "akshi-green-brown",
+      mode: "lifecycle",
+      queue: status.queue,
+      database: status.database,
+      redis: status.redis,
+      pollMs: status.pollMs,
+      lastTickAt: status.lastTickAt,
+      lastError: status.lastError,
       time: new Date().toISOString(),
     });
   };
@@ -29,11 +46,10 @@ export function createApp(): Express {
     const decision = decideFixLoop(config, iteration);
     res.status(200).json({
       ...decision,
-      stub: true,
       message:
         decision.action === "retry"
-          ? "fix-loop placeholder: enqueue another VERIFYING iteration"
-          : "fix-loop cap reached — ESCALATED / NEEDS_HUMAN",
+          ? "lifecycle loop enqueues a fixer job when a blocking gate fails"
+          : "fix-loop cap reached — run status escalated",
     });
   });
 

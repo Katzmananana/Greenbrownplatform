@@ -6,7 +6,7 @@ Autonomous **Green (ירוקה)** / **Brown (חומה)** agentic CI/CD. The plat
 - **CP2** — after the delivery package is ready
 - **CP3** — before promotion to production (same commit SHA as staging)
 
-This repository is the platform monorepo (`green-brown-platform`). It currently contains **infra + gates only**: service stubs, credit hard-stop, section-7 blocking CI, and a CP3 promote workflow. The gateway now serves a minimal MCP server (`create_run`, `get_run`, `approve`; see below). Other product features (Planner, Cursor coding agent, admin UI) are not implemented yet.
+This repository is the platform monorepo (`green-brown-platform`). It contains service skeletons, credit hard-stop, section-7 blocking CI, a CP3 promote workflow, a minimal gateway MCP server (`create_run`, `get_run`, `approve`), and the orchestrator run lifecycle (stub Planner/coder/fixer jobs). Real Planner, Cursor coding agent, and admin UI are not implemented yet.
 
 ## Lab scale
 
@@ -29,7 +29,7 @@ pnpm --filter @gb/gateway start
 # GET http://127.0.0.1:3000/health  →  200 {"status":"ok",...}
 ```
 
-Other stubs: orchestrator `:3001`, web `:3002`, worker `:3003` (override with `PORT`).
+Other services: orchestrator `:3001`, web `:3002`, worker `:3003` (override with `PORT`). The orchestrator loop stays idle until `DATABASE_URL` is set. Without `REDIS_URL` it completes agent jobs in-process; with `REDIS_URL` it enqueues them for the worker.
 
 ```bash
 pnpm lint
@@ -76,6 +76,37 @@ curl -s "${H[@]}" $URL -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params
 ```
 
 Claude Code: `claude mcp add --transport http gb-gateway http://127.0.0.1:3000/mcp --header "Authorization: Bearer $TOKEN"`.
+
+## Orchestrator lifecycle
+
+`apps/orchestrator` polls Postgres for runs the gateway created and advances `runs.phase` (migration `db/migrations/003_run_phase.sql`). MCP `stage` is unchanged: it is still derived only from approvals. The loop never writes `approvals` and only saves a transition when `status` is still `active` and `version` matches, so a concurrent `approve` — including CP3 → `succeeded` — wins.
+
+| Phase | What happens |
+|---|---|
+| `queued` | Credit check, then enqueue a `plan` job |
+| `planning` | Wait until the worker acks. Then `awaiting_cp1`, or `coding` if CP1 is already approved |
+| `awaiting_cp1` | Park until gateway records CP1. No code job before that |
+| `coding` | Wait for the `code` job, then run gates |
+| `gates` | Logic-only §7 results (no CI calls). Failure uses `decideFixLoop`: retry enqueues `fix`, cap sets `status=escalated` |
+| `fixing` | Wait for the fixer job, then gates again |
+| `awaiting_cp2` / `awaiting_cp3` | Park until that approval. CP3 is still closed by gateway `approve` |
+
+Over-budget work sets `status=needs_human` and does not enqueue. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+
+Worker (`apps/worker`) consumes BullMQ queue `jobs`. Handlers accept the payload (`v`, `name`, `runId`, `requestId`, `iteration`, `role`, `requestText`) and ack a stub result. They do not call a model.
+
+| Env | Role |
+|---|---|
+| `DATABASE_URL` | Postgres. Unset → loop idle, health stays up |
+| `REDIS_URL` | BullMQ. Unset → jobs complete inside the orchestrator and are **not** handed to the worker |
+| `ORCHESTRATOR_POLL_MS` | Poll interval, default `2000` |
+| `ORCHESTRATOR_LEASE_SECONDS` | Claim lease, default `30`. Not bumped on `runs.version` |
+| `ORCHESTRATOR_BATCH` | Runs per tick, default `10` |
+| `GB_AGENT_ESTIMATE_USD` | Estimated USD checked before each dispatch, default `0` (an already-over ledger still hard-stops) |
+| `GB_GATES_FAIL` | Comma-separated gate names the stub runner fails, for lab fix-loop checks |
+| `PORT` | HTTP port, default `3001` orchestrator / `3003` worker |
+
+`GET /health` on the orchestrator reports `mode: "lifecycle"`, `queue` (`off` | `inline` | `bullmq`), and `lastError` (for example a missing `003_run_phase.sql`).
 
 ## Credits (section 7b)
 

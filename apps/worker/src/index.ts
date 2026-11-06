@@ -1,34 +1,25 @@
 import { Worker } from "bullmq";
 import express from "express";
+import { JOB_QUEUE_NAME, bullmqConnectionFromUrl, type AgentJobPayload } from "@gb/shared";
+import { handleAgentJob } from "./handle.js";
 
 const port = Number(process.env.PORT ?? 3003);
-const redisUrl = process.env.REDIS_URL;
+const redisUrl = process.env.REDIS_URL?.trim() || undefined;
 
-function redisConnection(urlStr: string) {
-  const u = new URL(urlStr);
-  return {
-    host: u.hostname,
-    port: Number(u.port || 6379),
-    password: u.password ? decodeURIComponent(u.password) : undefined,
-    username: u.username ? decodeURIComponent(u.username) : undefined,
-  };
-}
-
-let worker: Worker | undefined;
+let worker: Worker<AgentJobPayload> | undefined;
 if (redisUrl) {
-  worker = new Worker(
-    "jobs",
-    async (job) => {
-      console.log(JSON.stringify({ msg: "worker stub handled job", name: job.name, id: job.id }));
-      return { ok: true, stub: true, name: job.name };
-    },
-    { connection: redisConnection(redisUrl) },
+  worker = new Worker<AgentJobPayload>(
+    JOB_QUEUE_NAME,
+    async (job) => handleAgentJob(job.name, job.data),
+    { connection: bullmqConnectionFromUrl(redisUrl) },
   );
   worker.on("error", (err) => {
     console.error(JSON.stringify({ msg: "worker error", error: err.message }));
   });
 } else {
-  console.log(JSON.stringify({ msg: "worker stub: REDIS_URL unset, HTTP health only" }));
+  console.log(
+    JSON.stringify({ msg: "REDIS_URL unset; worker HTTP health only", queue: JOB_QUEUE_NAME }),
+  );
 }
 
 const app = express();
@@ -39,6 +30,7 @@ const health = (_req: express.Request, res: express.Response): void => {
     service: "worker",
     platform: "akshi-green-brown",
     redis: Boolean(redisUrl),
+    queue: JOB_QUEUE_NAME,
     time: new Date().toISOString(),
   });
 };
@@ -47,7 +39,14 @@ app.get("/healthz", health);
 app.get("/readyz", health);
 
 const server = app.listen(port, () => {
-  console.log(JSON.stringify({ msg: "worker listening", port, redis: Boolean(redisUrl) }));
+  console.log(
+    JSON.stringify({
+      msg: "worker listening",
+      port,
+      redis: Boolean(redisUrl),
+      queue: JOB_QUEUE_NAME,
+    }),
+  );
 });
 
 async function shutdown(signal: string): Promise<void> {

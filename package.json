@@ -13,7 +13,7 @@
     "lint": "biome check .",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm test:unit && pnpm test:functional",
-    "test:unit": "pnpm --filter @gb/credits test && pnpm --filter @gb/gates test",
+    "test:unit": "pnpm --filter @gb/credits test && pnpm --filter @gb/gates test && pnpm --filter @gb/orchestrator test && pnpm --filter @gb/worker test",
     "test:functional": "pnpm --filter @gb/gateway test",
     "test:e2e": "node scripts/gates/e2e.mjs",
     "gate:reviewer": "node scripts/gates/reviewer.mjs",
