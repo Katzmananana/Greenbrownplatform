@@ -1,0 +1,19 @@
+# Service notes for the green-brown-platform monorepo.
+# Railway project: aab01577-7b18-4462-a98a-e63fd5257a39
+# Environment lab: e99cabae-42d5-46b9-a5a5-929f030e066a
+# Each service should set root = repo root and a start command below.
+# Tear-down = delete the Railway project.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+healthcheckPath = "/health"
+restartPolicyType = "ON_FAILURE"
+
+# Suggested per-service start commands (configure in the Railway dashboard):
+#   gateway:       pnpm --filter @gb/gateway start
+#   orchestrator:  pnpm --filter @gb/orchestrator start
+#   web:           pnpm --filter @gb/web start
+#   worker:        pnpm --filter @gb/worker start
+# Build command (all): pnpm install && pnpm -r build

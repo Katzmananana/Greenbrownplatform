@@ -1,0 +1,100 @@
+name: promote
+
+# CP3: a human must approve the GitHub environment `production` before promote.
+# Promote is the same commit SHA as staging (no code change).
+# Post-promote health failure → automatic rollback job + NEEDS_HUMAN.
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit SHA to promote (same SHA that is live on staging)
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+
+concurrency:
+  group: promote-production
+  cancel-in-progress: false
+
+jobs:
+  cp3-approval:
+    name: cp3-approval
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Record CP3 human approval
+        id: meta
+        run: |
+          SHA="${{ inputs.commit_sha }}"
+          if [ -z "$SHA" ]; then
+            echo "commit_sha is required"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "CP3 approved for SHA $SHA by ${{ github.actor }}"
+
+  promote:
+    name: promote
+    needs: [cp3-approval]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Promote the approved commit SHA
+        env:
+          COMMIT_SHA: ${{ needs.cp3-approval.outputs.sha }}
+          GB_RAILWAY_TOKEN: ${{ secrets.GB_RAILWAY_TOKEN }}
+        run: |
+          echo "Promoting $COMMIT_SHA to production (same SHA, no rebuild)."
+          if [ -z "$GB_RAILWAY_TOKEN" ]; then
+            echo "GB_RAILWAY_TOKEN unset — lab placeholder promote (record only)"
+            exit 0
+          fi
+          echo "TODO: call @gb/paas-railway.deploy(prodEnvironmentId, COMMIT_SHA)"
+
+  post-promote-health:
+    name: post-promote-health
+    needs: [promote]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check production health after promote
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+        run: |
+          if [ -z "$PRODUCTION_URL" ]; then
+            echo "PRODUCTION_URL unset — lab placeholder treats health as ok"
+            echo "Set vars.PRODUCTION_URL so a real post-promote failure triggers rollback"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/health.json -w "%{http_code}" "$PRODUCTION_URL/health" || true)
+          echo "health HTTP $code body=$(cat /tmp/health.json 2>/dev/null || true)"
+          if [ "$code" != "200" ]; then
+            echo "Post-promote health failed"
+            exit 1
+          fi
+
+  rollback:
+    name: rollback
+    needs: [cp3-approval, post-promote-health]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Automatic rollback to previous deployment
+        env:
+          COMMIT_SHA: ${{ needs.cp3-approval.outputs.sha }}
+          GB_RAILWAY_TOKEN: ${{ secrets.GB_RAILWAY_TOKEN }}
+        run: |
+          echo "Post-promote failure — automatic rollback of $COMMIT_SHA"
+          echo "NEEDS_HUMAN: production rollback triggered"
+          if [ -z "$GB_RAILWAY_TOKEN" ]; then
+            echo "GB_RAILWAY_TOKEN unset — recorded rollback intent only"
+            exit 0
+          fi
+          echo "TODO: call @gb/paas-railway.rollback(prodEnvironmentId, prevProdDeploymentId)"

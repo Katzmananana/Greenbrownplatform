@@ -1,0 +1,16 @@
+{
+  "id": "cfg-lab",
+  "orgId": "org-lab",
+  "maxFixIterations": 3,
+  "maxAllowedIterations": 5,
+  "maxCostUsd": 50,
+  "maxCostUsdPerRun": 10,
+  "perRoleBudgetUsd": {
+    "planner": 5,
+    "coder": 8,
+    "reviewer": 3,
+    "fixer": 5,
+    "reporter": 2
+  },
+  "creditAlertPct": 80
+}

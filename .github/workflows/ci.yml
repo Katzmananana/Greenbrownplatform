@@ -1,0 +1,197 @@
+name: CI
+
+# All §7 blocking gates. A failed job fails the workflow and must block merge.
+# Require these GitHub check names in branch protection:
+#   lint, typecheck, unit, functional, e2e, reviewer, acceptance,
+#   sast, load, load-staging, fix-loop, gates-required
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  GATE_STUB: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm typecheck
+
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm test:unit
+
+  functional:
+    name: functional
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm test:functional
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm test:e2e
+
+  reviewer:
+    name: reviewer
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run reviewer gate
+        env:
+          REVIEWER_TOKEN: ${{ secrets.REVIEWER_TOKEN }}
+        run: node scripts/gates/reviewer.mjs
+
+  acceptance:
+    name: acceptance
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acceptance vs original requirement
+        env:
+          REQUIREMENT_PATH: fixtures/requirement.md
+        run: node scripts/gates/acceptance.mjs
+
+  sast:
+    name: sast
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/gates/sast.mjs
+
+  load:
+    name: load
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: node scripts/gates/load.mjs
+
+  load-staging:
+    name: load-staging
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Staging load/perf placeholder
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+        run: node scripts/gates/load-staging.mjs
+
+  fix-loop:
+    name: fix-loop
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record fix-loop retry cap from org_config
+        run: node scripts/gates/fix-loop.mjs
+
+  gates-required:
+    name: gates-required
+    needs:
+      - lint
+      - typecheck
+      - unit
+      - functional
+      - e2e
+      - reviewer
+      - acceptance
+      - sast
+      - load
+      - load-staging
+      - fix-loop
+    runs-on: ubuntu-latest
+    steps:
+      - name: All §7 blocking gates passed
+        run: echo "lint typecheck unit functional e2e reviewer acceptance sast load load-staging fix-loop — all green"

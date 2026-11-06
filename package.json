@@ -1,0 +1,40 @@
+{
+  "name": "green-brown-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Akshi / Green-Brown Code Factory \u2014 autonomous Green (\u05d9\u05e8\u05d5\u05e7\u05d4) / Brown (\u05d7\u05d5\u05de\u05d4) agentic CI/CD with human checkpoints CP1/CP2/CP3",
+  "type": "module",
+  "packageManager": "pnpm@10.34.6",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "biome check .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm test:unit && pnpm test:functional",
+    "test:unit": "pnpm --filter @gb/credits test && pnpm --filter @gb/gates test",
+    "test:functional": "pnpm --filter @gb/gateway test",
+    "test:e2e": "node scripts/gates/e2e.mjs",
+    "gate:reviewer": "node scripts/gates/reviewer.mjs",
+    "gate:acceptance": "node scripts/gates/acceptance.mjs",
+    "gate:sast": "node scripts/gates/sast.mjs",
+    "gate:load": "node scripts/gates/load.mjs",
+    "gate:load-staging": "node scripts/gates/load-staging.mjs",
+    "gate:fix-loop": "node scripts/gates/fix-loop.mjs",
+    "dev:gateway": "pnpm --filter @gb/gateway start"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.10.0",
+    "autocannon": "^8.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.6"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@biomejs/biome", "esbuild", "msgpackr-extract"],
+    "overrides": {
+      "tinypool": ">=2.1.2"
+    }
+  }
+}
