@@ -1,16 +1,29 @@
 import express, { type Express } from "express";
 import { CreditGuard, defaultLabOrgConfig, InMemoryCreditLedger } from "@gb/credits";
+import { type McpAuthConfig, mcpAuthMiddleware } from "./mcp/auth.js";
+import { JSONRPC_ERRORS, handleJsonRpc, rpcError } from "./mcp/server.js";
 import { creditHardStopMiddleware } from "./middleware/credits.js";
+import { InMemoryRunStore } from "./store/memory.js";
+import type { RunStore } from "./store/types.js";
 
 export interface GatewayOptions {
   creditGuard?: CreditGuard;
   service?: string;
+  /** Defaults to an in-memory store; index.ts picks Postgres from DATABASE_URL. */
+  runStore?: RunStore;
+  /** Defaults to { token: GB_MCP_TOKEN, nodeEnv: NODE_ENV }. */
+  mcpAuth?: McpAuthConfig;
 }
 
 export function createApp(options: GatewayOptions = {}): Express {
   const creditGuard =
     options.creditGuard ?? new CreditGuard(defaultLabOrgConfig(), new InMemoryCreditLedger());
   const service = options.service ?? "gateway";
+  const runStore = options.runStore ?? new InMemoryRunStore();
+  const mcpAuth = options.mcpAuth ?? {
+    token: process.env.GB_MCP_TOKEN,
+    nodeEnv: process.env.NODE_ENV,
+  };
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "1mb" }));
@@ -20,6 +33,7 @@ export function createApp(options: GatewayOptions = {}): Express {
       status: "ok",
       service,
       platform: "akshi-green-brown",
+      runStore: runStore.kind,
       time: new Date().toISOString(),
     });
   };
@@ -28,17 +42,33 @@ export function createApp(options: GatewayOptions = {}): Express {
   app.get("/healthz", health);
   app.get("/readyz", health);
 
-  app.post("/mcp", creditHardStopMiddleware(creditGuard), (req, res) => {
-    const id = req.body && typeof req.body === "object" ? (req.body as { id?: unknown }).id : null;
-    res.status(200).json({
-      jsonrpc: "2.0",
-      id: id ?? null,
-      result: {
-        stub: true,
-        message: "MCP endpoint stub — tools will be registered in a later milestone",
-        tools: [],
-      },
-    });
+  // MCP over HTTP (JSON responses; no SSE stream). Auth first, then the credit
+  // hard-stop hook, then JSON-RPC dispatch.
+  app.post(
+    "/mcp",
+    mcpAuthMiddleware(mcpAuth),
+    creditHardStopMiddleware(creditGuard),
+    async (req, res, next) => {
+      try {
+        const response = await handleJsonRpc(req.body, {
+          store: runStore,
+          principal: String(res.locals.mcpPrincipal ?? "anonymous"),
+          ip: req.ip ?? null,
+        });
+        if (response === null) {
+          res.status(202).end();
+          return;
+        }
+        res.status(200).json(response);
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  app.get("/mcp", (_req, res) => {
+    res.setHeader("Allow", "POST");
+    res.status(405).json({ error: "method_not_allowed", message: "use POST /mcp (JSON-RPC)" });
   });
 
   app.post("/internal/credits/preflight", creditHardStopMiddleware(creditGuard), (_req, res) => {
@@ -46,7 +76,15 @@ export function createApp(options: GatewayOptions = {}): Express {
   });
 
   app.use(
-    (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    (err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const parseFailed =
+        typeof err === "object" &&
+        err !== null &&
+        (err as { type?: unknown }).type === "entity.parse.failed";
+      if (parseFailed && req.path === "/mcp") {
+        res.status(400).json(rpcError(null, JSONRPC_ERRORS.parseError, "parse error"));
+        return;
+      }
       const message = err instanceof Error ? err.message : "internal_error";
       res.status(500).json({ error: "internal_error", message });
     },

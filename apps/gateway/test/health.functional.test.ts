@@ -35,17 +35,17 @@ describe("gateway functional", () => {
     expect(body.service).toBe("gateway");
   });
 
-  it("POST /mcp stub responds and the credit hook allows zero-cost calls", async () => {
-    const started = await listen(createApp());
+  it("POST /mcp initialize responds and the credit hook allows zero-cost calls", async () => {
+    const started = await listen(createApp({ mcpAuth: { token: "t0k", nodeEnv: "test" } }));
     server = started.server;
     const res = await fetch(`${started.url}/mcp`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: "Bearer t0k" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { result: { stub: boolean } };
-    expect(body.result.stub).toBe(true);
+    const body = (await res.json()) as { result: { serverInfo: { name: string } } };
+    expect(body.result.serverInfo.name).toBe("gb-gateway");
   });
 
   it("credit hard-stop middleware blocks an over-budget LLM preflight", async () => {
