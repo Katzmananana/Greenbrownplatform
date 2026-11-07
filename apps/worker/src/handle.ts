@@ -2,12 +2,14 @@ import { parseAgentJobPayload } from "@gb/shared";
 
 export interface HandledJob {
   ok: true;
-  stub: true;
+  /** False when a Cursor Cloud Agents call was attempted or refused by policy. */
+  stub: boolean;
   name: string;
   runId: string | null;
   requestId: string | null;
   iteration: number | null;
   role: string | null;
+  provider?: "cursor_cloud_agents_v1";
 }
 
 export interface HandlerControl {

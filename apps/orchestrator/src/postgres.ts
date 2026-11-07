@@ -1,3 +1,4 @@
+import type { CursorCloudClient } from "@gb/cursor-cloud";
 import type {
   AgentJobPayload,
   Checkpoint,
@@ -9,6 +10,11 @@ import type {
 import { RUN_PHASES, agentJobId, decideRunSuccess } from "@gb/shared";
 import type { CreditLedgerStore } from "@gb/credits";
 import { defaultLabOrgConfig } from "@gb/credits";
+import {
+  cancelCursorRuns as cancelCursorRunsSql,
+  reconcileCursorCancels as reconcileCursorCancelsSql,
+  syncCursorDispatch as syncCursorDispatchSql,
+} from "./cursor-sync.js";
 import { configFromOrgRow, ledgerFromSums, type SpendSums } from "./credits.js";
 import {
   dispatchReason,
@@ -442,6 +448,22 @@ export class PostgresRunRepository implements RunRepository {
       [idempotencyKey],
     );
     return { executed: rows.length > 0 };
+  }
+
+  async syncCursorDispatch(
+    idempotencyKey: string,
+    client: CursorCloudClient | null,
+    staleSeconds: number,
+  ): Promise<"absent" | "active" | "completed" | "reconciled"> {
+    return syncCursorDispatchSql(this.pool, idempotencyKey, client, staleSeconds);
+  }
+
+  async cancelCursorRuns(runId: string, client: CursorCloudClient | null): Promise<void> {
+    await cancelCursorRunsSql(this.pool, runId, client);
+  }
+
+  async reconcileCursorCancels(client: CursorCloudClient | null, limit: number): Promise<number> {
+    return reconcileCursorCancelsSql(this.pool, client, limit);
   }
 
   async haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict"> {

@@ -6,7 +6,7 @@ Autonomous **Green (ירוקה)** / **Brown (חומה)** agentic CI/CD. The plat
 - **CP2** — after the delivery package is ready
 - **CP3** — before promotion to production (same commit SHA as staging)
 
-This repository is the platform monorepo (`green-brown-platform`). It contains service skeletons, credit hard-stop, section-7 blocking CI, a CP3 promote workflow, a minimal gateway MCP server (`create_run`, `get_run`, `approve`), and the orchestrator run lifecycle (stub Planner/coder/fixer jobs). Real Planner, Cursor coding agent, and admin UI are not implemented yet.
+This repository is the platform monorepo (`green-brown-platform`). It contains service skeletons, credit hard-stop, section-7 blocking CI, a CP3 promote workflow, a minimal gateway MCP server (`create_run`, `get_run`, `approve`), the orchestrator run lifecycle, and an opt-in Cursor Cloud Agents adapter for `code` and `fix`. Plan jobs stay stubs. The adapter does not make a run `succeeded`. Auth.js and the admin UI are not implemented.
 
 ## Lab scale
 
@@ -104,7 +104,21 @@ The worker does not run a job when `DATABASE_URL` is unset. Recovery does not en
 
 Gate results inside the run are placeholders. GitHub CI on this repo is also not a substitute for those run gates: `reviewer` passes only because `GATE_STUB=1`, `acceptance` matches a fixture, `sast` is a regex plus `pnpm audit`, `load` hammers gateway `/health` for two seconds, and `load-staging` / `e2e` are lab stubs. None of them execute the change request.
 
-Worker (`apps/worker`) consumes BullMQ queue `jobs`. Handlers accept the payload (`v`, `name`, `runId`, `requestId`, `iteration`, `role`, `requestText`) and ack a stub result. They do not call a model.
+Worker (`apps/worker`) consumes BullMQ queue `jobs`. Plan jobs still ack a stub. `code` and `fix` stay on the stub unless `GB_CURSOR_EXECUTOR=1` and `GB_CURSOR_API_BASE` is a loopback mock. The public Cursor API host is refused: the documented API has no per-run USD cap, so the adapter is not production-enabled for paid execution. It does not set `execution_mode=live`, does not write `run_evidence`, and does not turn a run into `succeeded`.
+
+The documented API is `https://api.cursor.com` (`POST /v1/agents`, `GET /v1/agents/{id}`, `GET /v1/agents/{id}/runs/{runId}`, `POST /v1/agents/{id}/runs/{runId}/cancel`). A client `agentId` (`bc-` plus a UUID derived from the dispatch key) is sent so a repeat create returns `409 agent_id_conflict` instead of a second agent. There is no documented `Idempotency-Key` header. A timeout or 5xx after the intent row is stored becomes `needs_reconciliation` and is not posted again. `GET /v1/agents/{id}/usage` reports tokens after the fact and is not a USD cap. This repo's credit ledger is a local reservation only. The create call does not send a model id and does not enforce a provider spend limit. Claude Code subscription credits are not Cursor API funds, and this adapter does not call Anthropic.
+
+`git.branches[]` on Get A Run has `repoUrl`, `branch`, and `prUrl`. Those are stored only when that repo matches `https://github.com/Katzmananana/Greenbrownplatform`. The stored `repo_url` is the provider's string (the docs omit the scheme). Commit SHA is not a documented run field, so `cursor_dispatch.commit_sha` stays null. `cancel_confirmed` is true only after Get A Run returns `CANCELLED`. A cancel POST by itself does not mean the remote run stopped.
+
+| Env | Role |
+|---|---|
+| `GB_CURSOR_EXECUTOR` | Unset leaves code jobs on the stub. `1` allows a loopback mock only. Any other value fails closed |
+| `CURSOR_API_KEY` or `GB_CURSOR_API_KEY` | Cursor Dashboard API key. Do not commit it. A key does not enable a paid launch |
+| `GB_CURSOR_REPO_URL` | Must be exactly the approved Greenbrownplatform repository. Any other URL, including TalentFit, is refused |
+| `GB_CURSOR_STARTING_REF` | Branch name sent as `startingRef`. Default `main`. Not a commit SHA |
+| `GB_CURSOR_API_BASE` | Loopback (`127.0.0.1` or `localhost`) is the mock. `https://api.cursor.com` is refused with `cursor_spend_cap_absent` |
+
+A mock launch also requires a non-empty `runs.plan_text`, an approved CP1, an active run inside `deadline_at` re-checked immediately before create, and a positive local org/run budget. That local estimate is not a provider cap. Apply `db/migrations/005_cursor_dispatch.sql` before the mock path. A real launch stays blocked until Cursor documents a per-run USD limit this process can enforce. Account spend limits are billing-cycle and not instant. `GET /v1/agents/{id}/usage` and SDK `getUsage()` report tokens or cents after the fact.
 
 | Env | Role |
 |---|---|

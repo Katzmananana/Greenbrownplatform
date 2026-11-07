@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@gb/cursor-cloud": "workspace:*",
     "@gb/credits": "workspace:*",
     "@gb/gates": "workspace:*",
     "@gb/shared": "workspace:*",

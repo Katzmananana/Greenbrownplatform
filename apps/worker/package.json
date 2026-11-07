@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@gb/cursor-cloud": "workspace:*",
     "@gb/shared": "workspace:*",
     "bullmq": "^5.34.5",
     "express": "^4.21.2",

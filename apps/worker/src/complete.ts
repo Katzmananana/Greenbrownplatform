@@ -1,4 +1,6 @@
-import { agentJobId, parseAgentJobPayload } from "@gb/shared";
+import type { CursorCloudClient, CursorExecutorConfig } from "@gb/cursor-cloud";
+import { agentJobId, parseAgentJobPayload, type AgentJobPayload } from "@gb/shared";
+import { executeCursorCodingJob } from "./cursor-job.js";
 import { handleAgentJob, type HandledJob } from "./handle.js";
 
 interface Queryable {
@@ -14,15 +16,21 @@ export type ExecuteResult = {
 /**
  * Job execution without a durable store is refused. The handler is not called.
  */
+export interface CodingExecutor {
+  config: CursorExecutorConfig;
+  client: CursorCloudClient | null;
+}
+
 export async function executeQueuedJob(
   db: Queryable | undefined,
   name: string,
   data: unknown,
+  coding?: CodingExecutor | null,
 ): Promise<ExecuteResult> {
   if (!db) {
     return { executed: false, reason: "durable_store_required", result: null };
   }
-  return completeDispatchOnce(db, name, data);
+  return completeDispatchOnce(db, name, data, undefined, coding);
 }
 
 export interface DispatchHooks {
@@ -47,10 +55,11 @@ export async function completeDispatchOnce(
   name: string,
   data: unknown,
   hooks?: DispatchHooks,
+  coding?: CodingExecutor | null,
 ): Promise<ExecuteResult> {
   const payload = parseAgentJobPayload(data);
   const key = payload ? agentJobId(payload) : null;
-  if (!key) {
+  if (!payload || !key) {
     return { executed: false, reason: "not_runnable", result: null };
   }
   const claimed = await db.query(
@@ -70,6 +79,24 @@ export async function completeDispatchOnce(
     return { executed: false, reason: "not_runnable", result: null };
   }
   const cancel = false;
+  const useCursor =
+    coding != null &&
+    coding.config.mode !== "off" &&
+    (payload.name === "code" || payload.name === "fix");
+  if (useCursor) {
+    const outcome = await executeCursorCodingJob(db, key, payload, coding.config, coding.client);
+    if (hooks?.afterHandler) await hooks.afterHandler();
+    const effect = outcome.disposition === "refused" ? "none" : "unknown";
+    const coded = codedResult(payload, effect);
+    if (outcome.disposition === "active") {
+      return { executed: true, result: coded };
+    }
+    const finish = await finishDispatch(db, key);
+    if (finish === "needs_reconciliation" || outcome.disposition !== "finished") {
+      return { executed: true, reason: "needs_reconciliation", result: coded };
+    }
+    return { executed: true, result: coded };
+  }
   const result = handleAgentJob(name, data, { cancelled: () => cancel });
   if (hooks?.afterHandler) await hooks.afterHandler();
   const finish = await finishDispatch(db, key);
@@ -155,6 +182,23 @@ export async function finishDispatch(
   ]);
   if (current.rows[0]?.state === "completed") return "completed";
   return "needs_reconciliation";
+}
+
+function codedResult(
+  payload: AgentJobPayload,
+  externalEffect: "none" | "unknown",
+): ExecuteResult["result"] {
+  return {
+    ok: true,
+    stub: false,
+    provider: "cursor_cloud_agents_v1",
+    name: payload.name,
+    runId: payload.runId,
+    requestId: payload.requestId,
+    iteration: payload.iteration,
+    role: payload.role,
+    externalEffect,
+  };
 }
 
 async function noteUnknownEffect(db: Queryable, runId: unknown): Promise<void> {

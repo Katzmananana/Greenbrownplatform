@@ -1,3 +1,4 @@
+import type { CursorCloudClient } from "@gb/cursor-cloud";
 import type { CreditAlert, OrgConfig } from "@gb/shared";
 import { CreditGuard, CreditHardStopError } from "@gb/credits";
 import type { JobDispatcher } from "./dispatcher.js";
@@ -24,6 +25,8 @@ export interface TickDeps {
   estimateUsd: number;
   /** Running rows older than this are needs_reconciliation, not left implicit. */
   staleSeconds?: number;
+  /** Null keeps code jobs on the local stub. Never used to create an agent. */
+  cursor?: CursorCloudClient | null;
   failGates?: readonly string[];
   gateRunner?: (run: RunSnapshot, config: OrgConfig) => { name: string; passed: boolean }[];
   onAlert?: (alert: CreditAlert) => void;
@@ -36,6 +39,7 @@ export interface TickDeps {
  */
 export async function runTick(deps: TickDeps): Promise<TickStats> {
   const stats: TickStats = { claimed: 0, saved: 0, conflicts: 0, enqueued: 0, errors: 0 };
+  await deps.repo.reconcileCursorCancels(deps.cursor ?? null, 5);
   const config = await deps.repo.loadConfig();
   const claimed = await deps.repo.claimDue(deps.batchSize, deps.leaseSeconds, deps.now);
   stats.claimed = claimed.length;
@@ -66,6 +70,7 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
         else {
           saved = true;
           stats.saved += 1;
+          await deps.repo.cancelCursorRuns(run.id, deps.cursor ?? null);
         }
       } else if (outcome.enqueue && outcome.patch) {
         const spend: DispatchSpend = {
@@ -142,11 +147,32 @@ async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
   let jobState: "missing" | "waiting" | "active" | "completed" | "failed" | null = null;
   let recovered = false;
   if (current.state === "running") {
-    const reconciled = await deps.repo.reconcileStaleRunning(
+    const synced = await deps.repo.syncCursorDispatch(
       current.idempotencyKey,
-      run,
+      deps.cursor ?? null,
       deps.staleSeconds ?? 30,
     );
+    if (synced === "reconciled") {
+      return {
+        run,
+        outcome: { patch: null, enqueue: null },
+        recovered: false,
+        reconciled: true,
+      };
+    }
+    if (synced === "completed") {
+      jobState = "completed";
+    } else if (synced === "active") {
+      jobState = "active";
+    }
+    const reconciled =
+      synced === "absent"
+        ? await deps.repo.reconcileStaleRunning(
+            current.idempotencyKey,
+            run,
+            deps.staleSeconds ?? 30,
+          )
+        : false;
     if (reconciled) {
       return {
         run,
@@ -155,7 +181,7 @@ async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
         reconciled: true,
       };
     }
-    jobState = "active";
+    if (synced === "absent") jobState = "active";
   } else if (current.state === "needs_reconciliation") {
     const halted = await deps.repo.haltRun(run, {
       status: "needs_human",
@@ -165,6 +191,7 @@ async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
       deadlineAt: run.deadlineAt,
     });
     if (halted === "ok") {
+      await deps.repo.cancelCursorRuns(run.id, deps.cursor ?? null);
       return {
         run,
         outcome: { patch: null, enqueue: null },

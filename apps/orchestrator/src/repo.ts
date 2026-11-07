@@ -1,3 +1,4 @@
+import type { CursorCloudClient } from "@gb/cursor-cloud";
 import type {
   AgentJobName,
   AgentJobPayload,
@@ -43,6 +44,22 @@ export interface RunRepository {
     run: RunSnapshot,
     staleSeconds: number,
   ): Promise<boolean>;
+  /**
+   * Read a Cursor handle, if one exists. Never creates an agent.
+   * `absent` means there is no handle (or the migration is not applied).
+   */
+  syncCursorDispatch(
+    idempotencyKey: string,
+    client: CursorCloudClient | null,
+    staleSeconds: number,
+  ): Promise<"absent" | "active" | "completed" | "reconciled">;
+  /** Ask Cursor to cancel. Does not claim the call was stopped. */
+  cancelCursorRuns(runId: string, client: CursorCloudClient | null): Promise<void>;
+  /**
+   * Retry cancel/status for handles whose local run may already be terminal.
+   * Never creates an agent. Returns how many due rows were visited.
+   */
+  reconcileCursorCancels(client: CursorCloudClient | null, limit: number): Promise<number>;
   /**
    * Terminal halt. Dispatches that have not started are cancelled. A running
    * dispatch becomes needs_reconciliation with cause halted_while_running.
@@ -312,6 +329,16 @@ export class MemoryRunRepository implements RunRepository {
   async markEnqueued(idempotencyKey: string): Promise<void> {
     const row = this.outbox.get(idempotencyKey);
     if (row && row.state === "pending") row.state = "enqueued";
+  }
+
+  async syncCursorDispatch(): Promise<"absent" | "active" | "completed" | "reconciled"> {
+    return "absent";
+  }
+
+  async cancelCursorRuns(): Promise<void> {}
+
+  async reconcileCursorCancels(): Promise<number> {
+    return 0;
   }
 
   async reconcileStaleRunning(

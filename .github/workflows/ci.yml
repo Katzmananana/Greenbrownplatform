@@ -202,7 +202,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @gb/shared build && pnpm --filter @gb/credits build && pnpm --filter @gb/gates build
+      - run: pnpm --filter @gb/shared build && pnpm --filter @gb/credits build && pnpm --filter @gb/gates build && pnpm --filter @gb/cursor-cloud build
       - name: Postgres and Redis safety suite
         run: pnpm --filter @gb/orchestrator exec vitest run test/safety.integration.test.ts
 
