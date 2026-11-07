@@ -1,3 +1,4 @@
+import { createCursorCloudClient, readCursorExecutorConfig } from "@gb/cursor-cloud";
 import { createApp, type LoopStatus } from "./app.js";
 import { createBullDispatcher } from "./bull.js";
 import { type JobDispatcher, MemoryJobDispatcher } from "./dispatcher.js";
@@ -7,6 +8,11 @@ import { createPostgresRepository } from "./postgres.js";
 import type { RunRepository } from "./repo.js";
 
 const env = readEnv();
+const cursorConfig = readCursorExecutorConfig();
+const cursorClient =
+  cursorConfig.mode === "ready"
+    ? createCursorCloudClient({ apiKey: cursorConfig.apiKey, apiBase: cursorConfig.apiBase })
+    : null;
 const status: LoopStatus = {
   queue: "off",
   database: false,
@@ -50,6 +56,7 @@ function scheduleTick(): void {
     estimateUsd: env.estimateUsd,
     staleSeconds: env.staleSeconds,
     failGates: env.failGates,
+    cursor: cursorClient,
   })
     .then((stats) => {
       status.lastTickAt = new Date().toISOString();

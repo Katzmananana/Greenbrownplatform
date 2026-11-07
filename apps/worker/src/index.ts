@@ -1,7 +1,8 @@
+import { createCursorCloudClient, readCursorExecutorConfig } from "@gb/cursor-cloud";
 import { Worker } from "bullmq";
 import express from "express";
 import { JOB_QUEUE_NAME, bullmqConnectionFromUrl, type AgentJobPayload } from "@gb/shared";
-import { executeQueuedJob } from "./complete.js";
+import { executeQueuedJob, type CodingExecutor } from "./complete.js";
 
 const port = Number(process.env.PORT ?? 3003);
 const redisUrl = process.env.REDIS_URL?.trim() || undefined;
@@ -24,6 +25,21 @@ if (databaseUrl) {
   if (Pool) dispatchDb = new Pool({ connectionString: databaseUrl, max: 2 });
 }
 
+const cursorConfig = readCursorExecutorConfig();
+const coding: CodingExecutor | null =
+  cursorConfig.mode === "off"
+    ? null
+    : {
+        config: cursorConfig,
+        client:
+          cursorConfig.mode === "ready"
+            ? createCursorCloudClient({
+                apiKey: cursorConfig.apiKey,
+                apiBase: cursorConfig.apiBase,
+              })
+            : null,
+      };
+
 let worker: Worker<AgentJobPayload> | undefined;
 if (redisUrl && !dispatchDb) {
   console.error(
@@ -37,7 +53,7 @@ if (redisUrl && !dispatchDb) {
   worker = new Worker<AgentJobPayload>(
     JOB_QUEUE_NAME,
     async (job) => {
-      const done = await executeQueuedJob(db, job.name, job.data);
+      const done = await executeQueuedJob(db, job.name, job.data, coding);
       if (!done.executed) {
         throw new Error(done.reason ?? "not_executed");
       }
@@ -63,6 +79,7 @@ const health = (_req: express.Request, res: express.Response): void => {
     platform: "akshi-green-brown",
     redis: Boolean(redisUrl),
     durable: Boolean(dispatchDb),
+    cursorExecutor: cursorConfig.mode,
     queue: JOB_QUEUE_NAME,
     time: new Date().toISOString(),
   });
