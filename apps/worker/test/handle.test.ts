@@ -23,6 +23,7 @@ describe("worker job handler", () => {
       requestId: payload.requestId,
       iteration: 2,
       role: "coder",
+      externalEffect: "none",
     });
   });
 
@@ -32,6 +33,7 @@ describe("worker job handler", () => {
       stub: true,
       name: "legacy",
       runId: null,
+      externalEffect: "none",
     });
   });
 

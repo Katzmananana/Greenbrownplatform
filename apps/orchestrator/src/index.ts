@@ -48,6 +48,7 @@ function scheduleTick(): void {
     leaseSeconds: env.leaseSeconds,
     batchSize: env.batchSize,
     estimateUsd: env.estimateUsd,
+    staleSeconds: env.staleSeconds,
     failGates: env.failGates,
   })
     .then((stats) => {
@@ -90,6 +91,7 @@ if (env.databaseUrl) {
         batch: env.batchSize,
         queue: status.queue,
         estimateUsd: env.estimateUsd,
+        staleSeconds: env.staleSeconds,
       }),
     );
     scheduleTick();

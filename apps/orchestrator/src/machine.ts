@@ -39,7 +39,7 @@ export function stepRun(run: RunSnapshot, ctx: StepContext): StepOutcome {
   if (run.status !== "active") return HOLD;
 
   const deadlineAt = ensureDeadline(run, ctx);
-  if (pastDeadline(ctx, deadlineAt)) {
+  if (runIsExpired(run, ctx.now, ctx.config.maxWallClockSeconds)) {
     return halt(run, "needs_human", "wall_clock", deadlineAt);
   }
 
@@ -216,9 +216,19 @@ function ensureDeadline(run: RunSnapshot, ctx: StepContext): string {
   return new Date(base + seconds * 1000).toISOString();
 }
 
-function pastDeadline(ctx: StepContext, deadlineAt: string): boolean {
-  if (ctx.config.maxWallClockSeconds <= 0) return false;
-  const at = Date.parse(deadlineAt);
-  if (!Number.isFinite(at)) return false;
-  return ctx.now.getTime() > at;
+/** Explicit deadline in the past always expires. Wall-clock applies when no deadline is stored. */
+export function runIsExpired(
+  run: Pick<RunSnapshot, "deadlineAt" | "startedAt">,
+  now: Date,
+  maxWallClockSeconds: number,
+): boolean {
+  if (run.deadlineAt) {
+    const at = Date.parse(run.deadlineAt);
+    if (Number.isFinite(at) && now.getTime() > at) return true;
+  }
+  if (maxWallClockSeconds > 0) {
+    const start = Date.parse(run.startedAt);
+    if (Number.isFinite(start) && now.getTime() > start + maxWallClockSeconds * 1000) return true;
+  }
+  return false;
 }

@@ -34,6 +34,15 @@ export interface RunRepository {
   markEnqueued(idempotencyKey: string): Promise<void>;
   /** First completion increments executions. A repeat is a no-op. */
   markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }>;
+  /**
+   * A `running` row with a stale heartbeat becomes needs_reconciliation and
+   * the run becomes needs_human. A fresh heartbeat is left alone.
+   */
+  reconcileStaleRunning(
+    idempotencyKey: string,
+    run: RunSnapshot,
+    staleSeconds: number,
+  ): Promise<boolean>;
   /** Terminal halt plus cancel of open dispatches, so recovery cannot resume them. */
   haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict">;
   close(): Promise<void>;
@@ -41,7 +50,15 @@ export interface RunRepository {
 
 export interface DispatchView {
   idempotencyKey: string;
-  state: "absent" | "pending" | "enqueued" | "running" | "completed" | "cancelled" | "failed";
+  state:
+    | "absent"
+    | "pending"
+    | "enqueued"
+    | "running"
+    | "completed"
+    | "cancelled"
+    | "failed"
+    | "needs_reconciliation";
   executions: number;
   payload: AgentJobPayload | null;
 }
@@ -277,6 +294,7 @@ export class MemoryRunRepository implements RunRepository {
           state: "pending",
           executions: 0,
           payload: spend.payload,
+          heartbeatAt: null,
         });
       }
       this.applyPatch(row, patch);
@@ -288,6 +306,29 @@ export class MemoryRunRepository implements RunRepository {
   async markEnqueued(idempotencyKey: string): Promise<void> {
     const row = this.outbox.get(idempotencyKey);
     if (row && row.state === "pending") row.state = "enqueued";
+  }
+
+  async reconcileStaleRunning(
+    idempotencyKey: string,
+    run: RunSnapshot,
+    staleSeconds: number,
+  ): Promise<boolean> {
+    const row = this.outbox.get(idempotencyKey);
+    if (!row || row.state !== "running") return false;
+    const beat = row.heartbeatAt ? Date.parse(row.heartbeatAt) : 0;
+    if (Date.now() - beat < staleSeconds * 1000) return false;
+    row.state = "needs_reconciliation";
+    const stored = this.rows.get(run.id);
+    if (stored && stored.status === "active") {
+      this.applyHalt(stored, {
+        status: "needs_human",
+        phase: stored.phase,
+        phaseReason: "needs_reconciliation",
+        iteration: stored.iteration,
+        deadlineAt: stored.deadlineAt,
+      });
+    }
+    return true;
   }
 
   async markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }> {
@@ -371,7 +412,15 @@ export class MemoryRunRepository implements RunRepository {
 }
 
 interface OutboxRow {
-  state: "pending" | "enqueued" | "running" | "completed" | "cancelled" | "failed";
+  state:
+    | "pending"
+    | "enqueued"
+    | "running"
+    | "completed"
+    | "cancelled"
+    | "failed"
+    | "needs_reconciliation";
+  heartbeatAt: string | null;
   executions: number;
   payload: AgentJobPayload;
 }

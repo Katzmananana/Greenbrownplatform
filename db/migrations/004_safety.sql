@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
   iteration integer NOT NULL,
   payload jsonb NOT NULL,
   cost_usd numeric(12, 6) NOT NULL CHECK (cost_usd > 0),
-  state text NOT NULL CHECK (state IN ('pending', 'enqueued', 'running', 'completed', 'cancelled', 'failed')),
+  state text NOT NULL CHECK (state IN (
+    'pending', 'enqueued', 'running', 'completed', 'cancelled', 'failed', 'needs_reconciliation'
+  )),
   executions integer NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now(),
   enqueued_at timestamptz,
@@ -40,9 +42,17 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
 CREATE INDEX IF NOT EXISTS dispatch_outbox_run_idx ON dispatch_outbox (run_id, state);
 
 -- Re-apply so databases created before `running` existed pick it up.
+ALTER TABLE dispatch_outbox ADD COLUMN IF NOT EXISTS heartbeat_at timestamptz;
+ALTER TABLE dispatch_outbox ADD COLUMN IF NOT EXISTS reconciliation text;
+
 ALTER TABLE dispatch_outbox DROP CONSTRAINT IF EXISTS dispatch_outbox_state_check;
 ALTER TABLE dispatch_outbox ADD CONSTRAINT dispatch_outbox_state_check
-  CHECK (state IN ('pending', 'enqueued', 'running', 'completed', 'cancelled', 'failed'));
+  CHECK (state IN (
+    'pending', 'enqueued', 'running', 'completed', 'cancelled', 'failed', 'needs_reconciliation'
+  ));
+
+COMMENT ON COLUMN dispatch_outbox.reconciliation IS
+  'Set when a running dispatch crashes or is cancelled in flight. Does not mean an external call was stopped.';
 
 CREATE UNIQUE INDEX IF NOT EXISTS credit_ledger_dispatch_uidx
   ON credit_ledger (run_id, reason)

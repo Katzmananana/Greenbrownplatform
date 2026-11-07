@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { defaultLabOrgConfig } from "@gb/credits";
 import {
   decideRunSuccess,
   isRunPhase,
@@ -195,7 +194,16 @@ export class PostgresRunStore implements RunStore {
   }
 }
 
-const REQUIRED_GATES = defaultLabOrgConfig().requiredChecks;
+async function configuredRequiredGates(db: PgQueryable): Promise<string[]> {
+  const present = await db.query(`SELECT to_regclass('public.org_config') AS name`);
+  if (!present.rows[0]?.name) return [];
+  const { rows } = await db.query(
+    `SELECT required_checks FROM org_config ORDER BY updated_at DESC LIMIT 1`,
+  );
+  const checks = rows[0]?.required_checks;
+  if (!Array.isArray(checks) || checks.length === 0) return [];
+  return checks.map((gate: unknown) => String(gate));
+}
 
 async function loadSuccess(
   db: PgQueryable,
@@ -230,7 +238,7 @@ async function loadSuccess(
     commitSha,
     artifactCommitSha,
     verifiedPassedGates: verified,
-    requiredGates: REQUIRED_GATES,
+    requiredGates: await configuredRequiredGates(db),
   });
 }
 

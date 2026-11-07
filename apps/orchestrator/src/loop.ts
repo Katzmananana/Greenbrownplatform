@@ -2,7 +2,7 @@ import type { CreditAlert, OrgConfig } from "@gb/shared";
 import { CreditGuard, CreditHardStopError } from "@gb/credits";
 import type { JobDispatcher } from "./dispatcher.js";
 import { evaluateStubGates } from "./gates.js";
-import { stepRun } from "./machine.js";
+import { runIsExpired, stepRun } from "./machine.js";
 import type { DispatchSpend, RunRepository } from "./repo.js";
 import type { RunSnapshot, SpendRole } from "./types.js";
 
@@ -22,6 +22,8 @@ export interface TickDeps {
   batchSize: number;
   /** Estimated USD charged before each stub agent dispatch. 0 still hard-stops an already-over ledger. */
   estimateUsd: number;
+  /** Running rows older than this are needs_reconciliation, not left implicit. */
+  staleSeconds?: number;
   failGates?: readonly string[];
   gateRunner?: (run: RunSnapshot, config: OrgConfig) => { name: string; passed: boolean }[];
   onAlert?: (alert: CreditAlert) => void;
@@ -42,6 +44,18 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
     let saved = false;
     try {
       const prepared = await prepareRun(deps, config, run);
+      if (prepared.reconciled) {
+        saved = true;
+        stats.saved += 1;
+        console.log(
+          JSON.stringify({
+            msg: "orchestrator needs_reconciliation",
+            runId: run.id,
+            reason: "needs_reconciliation",
+          }),
+        );
+        continue;
+      }
       const outcome = prepared.outcome;
       if (
         outcome.patch &&
@@ -122,13 +136,50 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
 }
 
 async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
+  const expired =
+    run.status !== "active" || runIsExpired(run, deps.now, config.maxWallClockSeconds);
   const current = await deps.repo.currentDispatch(run);
   let jobState: "missing" | "waiting" | "active" | "completed" | "failed" | null = null;
   let recovered = false;
-  if (current.state === "completed") jobState = "completed";
-  else if (current.state === "running") jobState = "active";
+  if (current.state === "running") {
+    const reconciled = await deps.repo.reconcileStaleRunning(
+      current.idempotencyKey,
+      run,
+      deps.staleSeconds ?? 30,
+    );
+    if (reconciled) {
+      return {
+        run,
+        outcome: { patch: null, enqueue: null },
+        recovered: false,
+        reconciled: true,
+      };
+    }
+    jobState = "active";
+  } else if (current.state === "needs_reconciliation") {
+    const halted = await deps.repo.haltRun(run, {
+      status: "needs_human",
+      phase: run.phase,
+      phaseReason: "needs_reconciliation",
+      iteration: run.iteration,
+      deadlineAt: run.deadlineAt,
+    });
+    if (halted === "ok") {
+      return {
+        run,
+        outcome: { patch: null, enqueue: null },
+        recovered: false,
+        reconciled: true,
+      };
+    }
+    jobState = "failed";
+  } else if (current.state === "completed") jobState = "completed";
   else if (current.state === "cancelled" || current.state === "failed") jobState = "failed";
-  else if (current.payload && (current.state === "pending" || current.state === "enqueued")) {
+  else if (
+    !expired &&
+    current.payload &&
+    (current.state === "pending" || current.state === "enqueued")
+  ) {
     const redis = await deps.jobs.state(current.payload);
     if (redis === "completed") {
       await deps.repo.markDispatchCompleted(current.idempotencyKey);
@@ -184,7 +235,7 @@ async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
       }
     },
   });
-  return { run: prepared, outcome, recovered };
+  return { run: prepared, outcome, recovered, reconciled: false };
 }
 
 function logAlert(alert: CreditAlert): void {

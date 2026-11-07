@@ -390,6 +390,45 @@ export class PostgresRunRepository implements RunRepository {
     );
   }
 
+  async reconcileStaleRunning(
+    idempotencyKey: string,
+    run: RunSnapshot,
+    staleSeconds: number,
+  ): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `UPDATE dispatch_outbox
+         SET state = 'needs_reconciliation', reconciliation = 'crash_after_running'
+         WHERE idempotency_key = $1
+           AND state = 'running'
+           AND (heartbeat_at IS NULL OR heartbeat_at < now() - ($2::int * interval '1 second'))
+         RETURNING run_id`,
+        [idempotencyKey, staleSeconds],
+      );
+      if (rows.length === 0) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      await client.query(
+        `UPDATE runs
+         SET status = 'needs_human', phase_reason = 'needs_reconciliation',
+             ended_at = COALESCE(ended_at, now()), heartbeat_at = now(),
+             lease_until = NULL, version = version + 1
+         WHERE id = $1::uuid AND status = 'active'`,
+        [run.id],
+      );
+      await client.query("COMMIT");
+      return true;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }> {
     const { rows } = await this.pool.query(
       `UPDATE dispatch_outbox

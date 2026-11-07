@@ -6,13 +6,19 @@ import { JOB_QUEUE_NAME, agentJobId, bullmqConnectionFromUrl } from "@gb/shared"
 import { signHumanJwt } from "../../gateway/src/mcp/human-auth.js";
 import { createApp } from "../../gateway/src/app.js";
 import { PostgresRunStore } from "../../gateway/src/store/postgres.js";
-import { completeDispatchOnce } from "../../worker/src/complete.js";
+import { completeDispatchOnce, finishDispatch } from "../../worker/src/complete.js";
 import { createBullDispatcher } from "../src/bull.js";
 import { runTick } from "../src/loop.js";
 import { createPostgresRepository } from "../src/postgres.js";
 
 const databaseUrl = process.env.GB_TEST_DATABASE_URL;
 const redisUrl = process.env.GB_TEST_REDIS_URL;
+
+if (process.env.GB_REQUIRE_SAFETY_INTEGRATION === "1" && (!databaseUrl || !redisUrl)) {
+  throw new Error(
+    "GB_REQUIRE_SAFETY_INTEGRATION=1 requires GB_TEST_DATABASE_URL and GB_TEST_REDIS_URL",
+  );
+}
 const FIXTURE_KEY = "hmac-fixture-key";
 const ORG = "00000000-0000-4000-8000-0000000000a1";
 const migrations = ["001_init.sql", "002_requests.sql", "003_run_phase.sql", "004_safety.sql"];
@@ -34,6 +40,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
     const ready = await pool.query(`SELECT to_regclass('public.dispatch_outbox') AS name`);
     if (!ready.rows[0]?.name) {
       for (const file of migrations) {
+        if (file === "004_safety.sql") continue;
         const sql = readFileSync(
           new URL(`../../../db/migrations/${file}`, import.meta.url),
           "utf8",
@@ -41,6 +48,11 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
         await pool.query(sql);
       }
     }
+    const safety = readFileSync(
+      new URL("../../../db/migrations/004_safety.sql", import.meta.url),
+      "utf8",
+    );
+    await pool.query(safety);
     repo = await createPostgresRepository(databaseUrl!);
     store = new PostgresRunStore(pool as never);
     jobs = createBullDispatcher(redisUrl!);
@@ -423,7 +435,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
       timed.runId,
     ]);
     expect(after.rows[0]?.status).toBe("needs_human");
-    expect(after.rows[0]?.phase_reason).toBe("wall_clock");
+    expect(["wall_clock", "needs_reconciliation"]).toContain(after.rows[0]?.phase_reason);
     const open = await pool.query(
       `SELECT count(*)::int AS n FROM dispatch_outbox WHERE run_id = $1 AND state IN ('pending','enqueued')`,
       [timed.runId],
@@ -435,5 +447,211 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
     const still = await pool.query(`SELECT status, phase FROM runs WHERE id = $1`, [timed.runId]);
     expect(still.rows[0]?.status).toBe("needs_human");
     expect(still.rows[0]?.phase).not.toBe("coding");
+  });
+
+  it("does not execute a dispatch whose deadline already passed", async () => {
+    await reset();
+    const run = await store.createRun({ request: "late" });
+    const [snap] = await repo.claimDue(1, 5, new Date());
+    if (!snap) throw new Error("expected a claimed run");
+    const org = await repo.loadConfig();
+    await repo.commitDispatch(
+      snap,
+      {
+        status: "active",
+        phase: "planning",
+        phaseReason: null,
+        iteration: 0,
+        deadlineAt: snap.deadlineAt,
+      },
+      {
+        orgId: org.orgId,
+        runId: snap.id,
+        requestId: snap.requestId,
+        role: "planner",
+        jobName: "plan",
+        iteration: 0,
+        costUsd: 1,
+        payload: {
+          v: 1,
+          name: "plan",
+          role: "planner",
+          runId: snap.id,
+          requestId: snap.requestId,
+          iteration: 0,
+          requestText: null,
+        },
+      },
+    );
+    await pool.query(`UPDATE runs SET deadline_at = now() - interval '1 minute' WHERE id = $1`, [
+      run.runId,
+    ]);
+    await tick(1);
+    expect(await executions(run.runId)).toBe(0);
+    const direct = await completeDispatchOnce(pool, "plan", {
+      v: 1,
+      name: "plan",
+      role: "planner",
+      runId: run.runId,
+      requestId: run.requestId,
+      iteration: 0,
+      requestText: null,
+    });
+    expect(direct.executed).toBe(false);
+    expect(direct.reason).toBe("not_runnable");
+    expect(await executions(run.runId)).toBe(0);
+  });
+
+  it("rejects CP3 until every org_config required check has same-commit evidence", async () => {
+    await reset();
+    await pool.query(
+      `UPDATE org_config SET required_checks = ARRAY['unit','extra_lab_gate']::text[] WHERE org_id = $1::uuid`,
+      [ORG],
+    );
+    const sha = "sha-extra";
+    const blocked = await store.createRun({ request: "missing extra gate" });
+    await pool.query(
+      `UPDATE runs SET phase = 'awaiting_cp3', execution_mode = 'live', commit_sha = $2 WHERE id = $1`,
+      [blocked.runId, sha],
+    );
+    await pool.query(
+      `INSERT INTO approvals (request_id, checkpoint, subject_hash, decision, user_id, auth_time)
+       VALUES ($1, 'CP1', 'h1', 'approved', 'human-fixture', now()),
+              ($1, 'CP2', 'h2', 'approved', 'human-fixture', now())`,
+      [blocked.requestId],
+    );
+    await pool.query(
+      `INSERT INTO run_evidence (run_id, commit_sha, kind, mode, uri)
+       VALUES ($1, $2, 'artifact', 'verified', 'file://artifact')`,
+      [blocked.runId, sha],
+    );
+    await pool.query(
+      `INSERT INTO run_evidence (run_id, commit_sha, kind, gate_name, mode, passed)
+       VALUES ($1, $2, 'gate', 'unit', 'verified', true)`,
+      [blocked.runId, sha],
+    );
+    const rejected = await store.approve({
+      runId: blocked.runId,
+      checkpoint: "CP3",
+      userId: "human-fixture",
+      authTime: new Date().toISOString(),
+    });
+    expect(rejected.status).toBe("needs_human");
+    expect(rejected.phaseReason).toBe("evidence_missing");
+
+    const ready = await store.createRun({ request: "extra gate present" });
+    await pool.query(
+      `UPDATE runs SET phase = 'awaiting_cp3', execution_mode = 'live', commit_sha = $2 WHERE id = $1`,
+      [ready.runId, sha],
+    );
+    await pool.query(
+      `INSERT INTO approvals (request_id, checkpoint, subject_hash, decision, user_id, auth_time)
+       VALUES ($1, 'CP1', 'h1', 'approved', 'human-fixture', now()),
+              ($1, 'CP2', 'h2', 'approved', 'human-fixture', now())`,
+      [ready.requestId],
+    );
+    await pool.query(
+      `INSERT INTO run_evidence (run_id, commit_sha, kind, mode, uri)
+       VALUES ($1, $2, 'artifact', 'verified', 'file://artifact')`,
+      [ready.runId, sha],
+    );
+    for (const gate of ["unit", "extra_lab_gate"]) {
+      await pool.query(
+        `INSERT INTO run_evidence (run_id, commit_sha, kind, gate_name, mode, passed)
+         VALUES ($1, $2, 'gate', $3, 'verified', true)`,
+        [ready.runId, sha, gate],
+      );
+    }
+    const accepted = await store.approve({
+      runId: ready.runId,
+      checkpoint: "CP3",
+      userId: "human-fixture",
+      authTime: new Date().toISOString(),
+    });
+    expect(accepted.status).toBe("succeeded");
+  });
+
+  it("surfaces crash-after-running as needs_reconciliation and does not execute again", async () => {
+    await reset();
+    const run = await store.createRun({ request: "crashed" });
+    const [snap] = await repo.claimDue(1, 5, new Date());
+    if (!snap) throw new Error("expected a claimed run");
+    const org = await repo.loadConfig();
+    await repo.commitDispatch(
+      snap,
+      {
+        status: "active",
+        phase: "planning",
+        phaseReason: null,
+        iteration: 0,
+        deadlineAt: snap.deadlineAt,
+      },
+      {
+        orgId: org.orgId,
+        runId: snap.id,
+        requestId: snap.requestId,
+        role: "planner",
+        jobName: "plan",
+        iteration: 0,
+        costUsd: 1,
+        payload: {
+          v: 1,
+          name: "plan",
+          role: "planner",
+          runId: snap.id,
+          requestId: snap.requestId,
+          iteration: 0,
+          requestText: null,
+        },
+      },
+    );
+    await pool.query(
+      `UPDATE dispatch_outbox
+       SET state = 'running', executions = 1, heartbeat_at = now() - interval '2 hours'
+       WHERE run_id = $1`,
+      [run.runId],
+    );
+    await tick(1);
+    const stored = await pool.query(`SELECT status, phase_reason FROM runs WHERE id = $1`, [
+      run.runId,
+    ]);
+    expect(stored.rows[0]).toMatchObject({
+      status: "needs_human",
+      phase_reason: "needs_reconciliation",
+    });
+    const box = await pool.query(
+      `SELECT state, reconciliation, executions FROM dispatch_outbox WHERE run_id = $1`,
+      [run.runId],
+    );
+    expect(box.rows[0]).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "crash_after_running",
+      executions: 1,
+    });
+    await tick(1);
+    expect(await executions(run.runId)).toBe(1);
+
+    const inflight = await store.createRun({ request: "cancel mid flight" });
+    await pool.query(`UPDATE runs SET phase = 'planning' WHERE id = $1`, [inflight.runId]);
+    const key = agentJobId({ name: "plan", runId: inflight.runId, iteration: 0 });
+    await pool.query(
+      `INSERT INTO dispatch_outbox
+         (idempotency_key, org_id, run_id, request_id, job_name, role, iteration, payload, cost_usd, state, executions, heartbeat_at)
+       VALUES ($1, $2::uuid, $3, $4, 'plan', 'planner', 0, '{}'::jsonb, 1, 'running', 1, now())`,
+      [key, ORG, inflight.runId, inflight.requestId],
+    );
+    await pool.query(`UPDATE runs SET deadline_at = now() - interval '1 minute' WHERE id = $1`, [
+      inflight.runId,
+    ]);
+    const finished = await finishDispatch(pool, key);
+    expect(finished).toBe("needs_reconciliation");
+    const after = await pool.query(
+      `SELECT state, reconciliation FROM dispatch_outbox WHERE idempotency_key = $1`,
+      [key],
+    );
+    expect(after.rows[0]).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "external_effect_unknown",
+    });
   });
 });

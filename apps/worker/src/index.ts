@@ -1,8 +1,7 @@
 import { Worker } from "bullmq";
 import express from "express";
 import { JOB_QUEUE_NAME, bullmqConnectionFromUrl, type AgentJobPayload } from "@gb/shared";
-import { completeDispatchOnce } from "./complete.js";
-import { handleAgentJob } from "./handle.js";
+import { executeQueuedJob } from "./complete.js";
 
 const port = Number(process.env.PORT ?? 3003);
 const redisUrl = process.env.REDIS_URL?.trim() || undefined;
@@ -26,12 +25,22 @@ if (databaseUrl) {
 }
 
 let worker: Worker<AgentJobPayload> | undefined;
-if (redisUrl) {
+if (redisUrl && !dispatchDb) {
+  console.error(
+    JSON.stringify({
+      msg: "worker fail-closed: REDIS_URL is set but DATABASE_URL is missing; jobs are not executed",
+      queue: JOB_QUEUE_NAME,
+    }),
+  );
+} else if (redisUrl && dispatchDb) {
+  const db = dispatchDb;
   worker = new Worker<AgentJobPayload>(
     JOB_QUEUE_NAME,
     async (job) => {
-      if (!dispatchDb) return handleAgentJob(job.name, job.data);
-      const done = await completeDispatchOnce(dispatchDb, job.name, job.data);
+      const done = await executeQueuedJob(db, job.name, job.data);
+      if (!done.executed) {
+        throw new Error(done.reason ?? "not_executed");
+      }
       return done.result;
     },
     { connection: bullmqConnectionFromUrl(redisUrl) },
@@ -53,6 +62,7 @@ const health = (_req: express.Request, res: express.Response): void => {
     service: "worker",
     platform: "akshi-green-brown",
     redis: Boolean(redisUrl),
+    durable: Boolean(dispatchDb),
     queue: JOB_QUEUE_NAME,
     time: new Date().toISOString(),
   });

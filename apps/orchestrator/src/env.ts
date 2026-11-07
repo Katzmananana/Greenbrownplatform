@@ -6,6 +6,7 @@ export interface OrchestratorEnv {
   leaseSeconds: number;
   batchSize: number;
   estimateUsd: number;
+  staleSeconds: number;
   failGates: string[];
 }
 
@@ -18,6 +19,7 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): OrchestratorEnv {
     leaseSeconds: intEnv(env.ORCHESTRATOR_LEASE_SECONDS, 30, 1),
     batchSize: intEnv(env.ORCHESTRATOR_BATCH, 10, 1),
     estimateUsd: floatEnv(env.GB_AGENT_ESTIMATE_USD, 0),
+    staleSeconds: intEnv(env.GB_DISPATCH_STALE_SECONDS, 30, 1),
     failGates: (env.GB_GATES_FAIL ?? "")
       .split(",")
       .map((name) => name.trim())
