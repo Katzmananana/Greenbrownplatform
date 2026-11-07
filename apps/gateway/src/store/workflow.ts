@@ -72,7 +72,16 @@ export function assertCanApprove(
   }
 }
 
-/** CP3 is the last human gate: approving it closes the run as succeeded. */
-export function statusAfterApproval(current: RunStatus, checkpoint: Checkpoint): RunStatus {
-  return checkpoint === "CP3" ? "succeeded" : current;
+/**
+ * CP1 and CP2 leave the run active. CP3 becomes succeeded only when the caller
+ * has already proved live execution plus same-commit evidence. Otherwise the
+ * human decision is recorded and the run stops as needs_human, not succeeded.
+ */
+export function statusAfterApproval(
+  current: RunStatus,
+  checkpoint: Checkpoint,
+  success: boolean,
+): RunStatus {
+  if (checkpoint !== "CP3") return current;
+  return success ? "succeeded" : "needs_human";
 }

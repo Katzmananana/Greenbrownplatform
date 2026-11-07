@@ -14,7 +14,12 @@ describe.skipIf(!url)("PostgresRunStore (integration)", () => {
       expect(run.phase).toBe("queued");
       expect(run.stage).toBe("awaiting_cp1");
       await expect(
-        store.approve({ runId: run.runId, checkpoint: "CP1", userId: "it" }),
+        store.approve({
+          runId: run.runId,
+          checkpoint: "CP1",
+          userId: "human-fixture",
+          authTime: new Date().toISOString(),
+        }),
       ).rejects.toMatchObject({ code: "not_ready" });
       const stored = await store.getRun(run.runId);
       expect(stored?.status).toBe("active");

@@ -28,3 +28,5 @@ export { JOB_QUEUE_NAME, agentJobId, parseAgentJobPayload } from "./jobs.js";
 export type { AgentJobName, AgentJobPayload } from "./jobs.js";
 export { bullmqConnectionFromUrl } from "./redis.js";
 export type { BullmqConnection } from "./redis.js";
+export { decideRunSuccess } from "./success.js";
+export type { ExecutionMode, SuccessBlock } from "./success.js";

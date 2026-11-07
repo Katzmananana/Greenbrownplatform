@@ -60,6 +60,14 @@ export function stepRun(run: RunSnapshot, ctx: StepContext): StepOutcome {
       return move(run, "awaiting_cp3", deadlineAt);
     case "awaiting_cp3":
       if (!run.approved.includes("CP3")) return HOLD;
+      if (run.executionMode !== "live" || !run.evidenceReady) {
+        return halt(
+          run,
+          "needs_human",
+          run.executionMode !== "live" ? "simulation_not_success" : "evidence_missing",
+          deadlineAt,
+        );
+      }
       return succeed(run, deadlineAt);
     default:
       return HOLD;

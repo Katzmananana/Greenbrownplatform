@@ -23,7 +23,7 @@ function harness(repo = new MemoryRunRepository()) {
       now: NOW,
       leaseSeconds: 30,
       batchSize: 10,
-      estimateUsd: 0,
+      estimateUsd: 1,
       ...(gateRunner ? { gateRunner: gateRunner as never } : {}),
     });
   return { repo, jobs, tick };
@@ -92,9 +92,9 @@ describe("run lifecycle loop", () => {
     expect(repo.get(RUN_ID)).toMatchObject({ phase: "awaiting_cp3", status: "active" });
 
     repo.recordGatewayApproval(RUN_ID, "CP3");
-    expect(repo.get(RUN_ID)?.status).toBe("succeeded");
+    expect(repo.get(RUN_ID)?.status).toBe("needs_human");
+    expect(repo.get(RUN_ID)?.phaseReason).toBe("simulation_not_success");
     expect((await tick()).claimed).toBe(0);
-    expect(repo.get(RUN_ID)?.phase).toBe("awaiting_cp3");
   });
 
   it("rejects CP1 before planning finishes and does not mark the run succeeded", async () => {

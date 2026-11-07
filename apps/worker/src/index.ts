@@ -1,16 +1,39 @@
 import { Worker } from "bullmq";
 import express from "express";
 import { JOB_QUEUE_NAME, bullmqConnectionFromUrl, type AgentJobPayload } from "@gb/shared";
+import { completeDispatchOnce } from "./complete.js";
 import { handleAgentJob } from "./handle.js";
 
 const port = Number(process.env.PORT ?? 3003);
 const redisUrl = process.env.REDIS_URL?.trim() || undefined;
 
+const databaseUrl = process.env.DATABASE_URL?.trim() || undefined;
+let dispatchDb: { query(text: string, params?: unknown[]): Promise<{ rows: any[] }> } | undefined;
+if (databaseUrl) {
+  const moduleName = "pg";
+  const mod = (await import(moduleName)) as {
+    default?: {
+      Pool?: new (config: { connectionString: string; max?: number }) => {
+        query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+      };
+    };
+    Pool?: new (config: { connectionString: string; max?: number }) => {
+      query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+    };
+  };
+  const Pool = mod.default?.Pool ?? mod.Pool;
+  if (Pool) dispatchDb = new Pool({ connectionString: databaseUrl, max: 2 });
+}
+
 let worker: Worker<AgentJobPayload> | undefined;
 if (redisUrl) {
   worker = new Worker<AgentJobPayload>(
     JOB_QUEUE_NAME,
-    async (job) => handleAgentJob(job.name, job.data),
+    async (job) => {
+      if (!dispatchDb) return handleAgentJob(job.name, job.data);
+      const done = await completeDispatchOnce(dispatchDb, job.name, job.data);
+      return done.result;
+    },
     { connection: bullmqConnectionFromUrl(redisUrl) },
   );
   worker.on("error", (err) => {

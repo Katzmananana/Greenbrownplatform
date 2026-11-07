@@ -49,11 +49,13 @@ Tools:
 |---|---|---|
 | `create_run` | `{ request: string }` | `{ runId, status, stage, phase, requestId }` — new run, `status: "active"`, `phase: "queued"`, `stage: "awaiting_cp1"` |
 | `get_run` | `{ runId: string }` | full run: `status`, `phase`, `stage`, `request`, `approvals[]`, `version`, timestamps |
-| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` | records the approval only when `phase` is `awaiting_cp1` / `awaiting_cp2` / `awaiting_cp3` for that checkpoint, in order, once each. CP3 at `awaiting_cp3` sets `status: "succeeded"` |
+| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` plus header `X-GB-Human-Authorization: Bearer <jwt>` | records the approval only for a fresh human JWT, and only when `phase` matches that checkpoint. CP3 sets `succeeded` only for a live run with same-commit artifact and verified gates. Simulation ends `needs_human`. |
 
-`stage` is still the next human checkpoint derived from approvals. `phase` is the orchestrator lifecycle. A fresh run reports `stage: "awaiting_cp1"` and `phase: "queued"`; CP1 is rejected with `not_ready` until planning finishes and `phase` is `awaiting_cp1`. CP2 waits until gates have passed. CP3 cannot close the run before that.
+`stage` is still the next human checkpoint derived from approvals. `phase` is the orchestrator lifecycle. A fresh run reports `stage: "awaiting_cp1"` and `phase: "queued"`; CP1 is rejected with `not_ready` until planning finishes. The agent `Authorization` bearer cannot be reused as the human JWT.
 
-Tool failures come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved`, `run_not_active`, or `not_ready`.
+Human JWT (HS256), issued by the human IdP, not by this repo: claims `sub`, `auth_time` (unix seconds of reauthentication), `exp`. Sign with `GB_HUMAN_APPROVAL_SECRET`. `auth_time` older than `GB_HUMAN_AUTH_MAX_AGE_SECONDS` (default 300) is `human_auth_stale`. Unset secret is `human_auth_not_configured`. Tests use an ephemeral fixture key; do not commit a production secret. Auth.js is the intended issuer later.
+
+Tool failures come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved`, `run_not_active`, `not_ready`, `human_auth_required`, `human_auth_invalid`, `human_auth_stale`, or `human_auth_not_configured`.
 
 **Auth** — every `/mcp` call needs `Authorization: Bearer <token>`:
 
@@ -94,7 +96,9 @@ Claude Code: `claude mcp add --transport http gb-gateway http://127.0.0.1:3000/m
 | `awaiting_cp2` | Park until CP2. CP3 is still rejected |
 | `awaiting_cp3` | Park until CP3. That approval is what sets `status=succeeded` |
 
-Approvals already present do not skip planning, coding, or gates, and they do not close the run before `awaiting_cp3`. When `GB_AGENT_ESTIMATE_USD` is greater than 0, each new dispatch appends that estimate to `credit_ledger` once (same role and iteration is not charged again if the job is re-enqueued). Over budget sets `status=needs_human` and does not enqueue. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+Approvals already present do not skip planning, coding, or gates. `GB_AGENT_ESTIMATE_USD` must be greater than 0. The estimate, the `dispatch_outbox` row, and the phase change commit together under a Postgres advisory lock, so two runs cannot both pass an aggregate cap. A zero estimate is `unbudgeted_estimate` and is not enqueued. Re-enqueue of an open outbox row does not insert another charge. A `completed` outbox row is not executed again if the Redis result is deleted. Wall-clock timeout and the fix-loop cap cancel open dispatches and leave a terminal status. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+
+`execution_mode` defaults to `simulation`. Simulation CP3 is `needs_human` with `simulation_not_success`, never `succeeded`. `succeeded` requires `execution_mode=live`, `runs.commit_sha`, a `run_evidence` artifact for that sha, and a `verified` pass of every required gate for that same sha, plus CP3. This PR does not produce live evidence.
 
 Gate results inside the run are placeholders. GitHub CI on this repo is also not a substitute for those run gates: `reviewer` passes only because `GATE_STUB=1`, `acceptance` matches a fixture, `sast` is a regex plus `pnpm audit`, `load` hammers gateway `/health` for two seconds, and `load-staging` / `e2e` are lab stubs. None of them execute the change request.
 
@@ -107,7 +111,7 @@ Worker (`apps/worker`) consumes BullMQ queue `jobs`. Handlers accept the payload
 | `ORCHESTRATOR_POLL_MS` | Poll interval, default `2000` |
 | `ORCHESTRATOR_LEASE_SECONDS` | Claim lease, default `30`. Not bumped on `runs.version` |
 | `ORCHESTRATOR_BATCH` | Runs per tick, default `10` |
-| `GB_AGENT_ESTIMATE_USD` | Estimated USD checked before each dispatch, default `0` (an already-over ledger still hard-stops) |
+| `GB_AGENT_ESTIMATE_USD` | Reservation per dispatch. `0` or unset refuses the dispatch (`unbudgeted_estimate`) |
 | `GB_GATES_FAIL` | Comma-separated gate names the stub runner fails, for lab fix-loop checks |
 | `PORT` | HTTP port, default `3001` orchestrator / `3003` worker |
 

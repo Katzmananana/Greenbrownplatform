@@ -2,8 +2,8 @@ import type { CreditAlert, OrgConfig } from "@gb/shared";
 import { CreditGuard, CreditHardStopError } from "@gb/credits";
 import type { JobDispatcher } from "./dispatcher.js";
 import { evaluateStubGates } from "./gates.js";
-import { agentSpecForPhase, stepRun } from "./machine.js";
-import type { RunRepository } from "./repo.js";
+import { stepRun } from "./machine.js";
+import type { DispatchSpend, RunRepository } from "./repo.js";
 import type { RunSnapshot, SpendRole } from "./types.js";
 
 export interface TickStats {
@@ -41,36 +41,52 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
   for (const run of claimed) {
     let saved = false;
     try {
-      const outcome = await advance(deps, config, run);
-      if (outcome.patch) {
-        const result = await deps.repo.save(run, outcome.patch);
-        if (result === "conflict") {
-          stats.conflicts += 1;
-          console.log(
-            JSON.stringify({
-              msg: "orchestrator skipped conflicting write",
-              runId: run.id,
-              version: run.version,
-            }),
-          );
-          continue;
+      const prepared = await prepareRun(deps, config, run);
+      const outcome = prepared.outcome;
+      if (
+        outcome.patch &&
+        (outcome.patch.status === "needs_human" || outcome.patch.status === "escalated")
+      ) {
+        const halted = await deps.repo.haltRun(prepared.run, outcome.patch);
+        if (halted === "conflict") stats.conflicts += 1;
+        else {
+          saved = true;
+          stats.saved += 1;
         }
-        saved = true;
-        stats.saved += 1;
-        if (outcome.enqueue && deps.estimateUsd > 0) {
-          await deps.repo.recordDispatch({
-            orgId: config.orgId,
-            runId: run.id,
-            requestId: run.requestId,
-            role: outcome.enqueue.role,
-            jobName: outcome.enqueue.name,
-            iteration: outcome.enqueue.iteration,
-            costUsd: deps.estimateUsd,
-          });
+      } else if (outcome.enqueue && outcome.patch) {
+        const spend: DispatchSpend = {
+          orgId: config.orgId,
+          runId: run.id,
+          requestId: run.requestId,
+          role: outcome.enqueue.role,
+          jobName: outcome.enqueue.name,
+          iteration: outcome.enqueue.iteration,
+          costUsd: deps.estimateUsd,
+          payload: outcome.enqueue,
+        };
+        const committed = await deps.repo.commitDispatch(prepared.run, outcome.patch, spend);
+        if (committed.status === "conflict") stats.conflicts += 1;
+        else if (committed.status === "budget") {
+          saved = true;
+          stats.saved += 1;
+        } else if (committed.status === "pending") {
+          await deps.jobs.enqueue(outcome.enqueue);
+          await deps.repo.markEnqueued(committed.idempotencyKey);
+          saved = true;
+          stats.saved += 1;
+          stats.enqueued += 1;
+        } else {
+          saved = true;
+          stats.saved += 1;
         }
-      }
-      if (outcome.enqueue) {
-        await deps.jobs.enqueue(outcome.enqueue);
+      } else if (outcome.patch) {
+        const result = await deps.repo.save(prepared.run, outcome.patch);
+        if (result === "conflict") stats.conflicts += 1;
+        else {
+          saved = true;
+          stats.saved += 1;
+        }
+      } else if (prepared.recovered) {
         stats.enqueued += 1;
       }
       if (outcome.patch || outcome.enqueue) {
@@ -105,34 +121,59 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
   return stats;
 }
 
-async function advance(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
-  const spec = agentSpecForPhase(run.phase);
-  const jobState = spec
-    ? await deps.jobs.state({ name: spec.name, runId: run.id, iteration: run.iteration })
-    : null;
+async function prepareRun(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
+  const current = await deps.repo.currentDispatch(run);
+  let jobState: "missing" | "waiting" | "active" | "completed" | "failed" | null = null;
+  let recovered = false;
+  if (current.state === "completed") jobState = "completed";
+  else if (current.state === "running") jobState = "active";
+  else if (current.state === "cancelled" || current.state === "failed") jobState = "failed";
+  else if (current.payload && (current.state === "pending" || current.state === "enqueued")) {
+    const redis = await deps.jobs.state(current.payload);
+    if (redis === "completed") {
+      await deps.repo.markDispatchCompleted(current.idempotencyKey);
+      jobState = "completed";
+    } else if (redis === "failed") jobState = "failed";
+    else if (redis === "missing") {
+      await deps.jobs.enqueue(current.payload);
+      await deps.repo.markEnqueued(current.idempotencyKey);
+      recovered = true;
+      jobState = "waiting";
+    } else {
+      jobState = redis === "active" ? "active" : "waiting";
+    }
+  }
+  const success = await deps.repo.loadSuccess(run.id, config.requiredChecks);
+  const prepared: RunSnapshot = {
+    ...run,
+    executionMode: success.executionMode,
+    evidenceReady: success.evidenceReady,
+  };
   const gates =
-    run.phase === "gates"
+    prepared.phase === "gates"
       ? (deps.gateRunner ?? ((snapshot, org) => evaluateStubGates(org, deps.failGates ?? [])))(
-          run,
+          prepared,
           config,
         )
       : [];
-  const ledger = await deps.repo.loadLedger(config.orgId, run.id);
+  const ledger = await deps.repo.loadLedger(config.orgId, prepared.id);
   const guard = new CreditGuard(config, ledger, deps.onAlert ?? logAlert);
-  const estimate = deps.estimateUsd > 0 ? deps.estimateUsd : 0;
-  return stepRun(run, {
+  const outcome = stepRun(prepared, {
     now: deps.now,
     config,
     jobState,
     gates,
     assertSpend: (role: SpendRole) => {
+      if (!(deps.estimateUsd > 0)) {
+        return { ok: false, message: "unbudgeted_estimate" };
+      }
       try {
         guard.assertCanSpend({
           orgId: config.orgId,
-          runId: run.id,
-          requestId: run.requestId,
+          runId: prepared.id,
+          requestId: prepared.requestId,
           role,
-          estimatedCostUsd: estimate,
+          estimatedCostUsd: deps.estimateUsd,
           provider: "none",
           model: "stub",
         });
@@ -143,6 +184,7 @@ async function advance(deps: TickDeps, config: OrgConfig, run: RunSnapshot) {
       }
     },
   });
+  return { run: prepared, outcome, recovered };
 }
 
 function logAlert(alert: CreditAlert): void {

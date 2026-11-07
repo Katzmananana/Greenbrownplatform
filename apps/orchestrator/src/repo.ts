@@ -1,5 +1,13 @@
-import type { AgentJobName, Checkpoint, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
-import { phaseAcceptsCheckpoint } from "@gb/shared";
+import type {
+  AgentJobName,
+  AgentJobPayload,
+  Checkpoint,
+  ExecutionMode,
+  OrgConfig,
+  RunPhase,
+  RunStatus,
+} from "@gb/shared";
+import { agentJobId, phaseAcceptsCheckpoint } from "@gb/shared";
 import type { CreditLedgerStore } from "@gb/credits";
 import { InMemoryCreditLedger, defaultLabOrgConfig } from "@gb/credits";
 import { isDue } from "./due.js";
@@ -13,13 +21,35 @@ export interface RunRepository {
   release(id: string, version: number): Promise<void>;
   loadConfig(): Promise<OrgConfig>;
   loadLedger(orgId: string, runId: string): Promise<CreditLedgerStore>;
+  loadSuccess(
+    runId: string,
+    requiredGates: readonly string[],
+  ): Promise<{ executionMode: ExecutionMode; evidenceReady: boolean }>;
+  currentDispatch(run: RunSnapshot): Promise<DispatchView>;
   /**
-   * Record the estimated cost of a new agent dispatch once. Re-enqueue of the
-   * same role+iteration must not call this again.
+   * Reserve the estimate, write the outbox row, and advance the phase in one
+   * critical section. A second call with the same key does not charge again.
    */
-  recordDispatch(input: DispatchSpend): Promise<void>;
+  commitDispatch(prev: RunSnapshot, patch: RunPatch, spend: DispatchSpend): Promise<CommitResult>;
+  markEnqueued(idempotencyKey: string): Promise<void>;
+  /** First completion increments executions. A repeat is a no-op. */
+  markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }>;
+  /** Terminal halt plus cancel of open dispatches, so recovery cannot resume them. */
+  haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict">;
   close(): Promise<void>;
 }
+
+export interface DispatchView {
+  idempotencyKey: string;
+  state: "absent" | "pending" | "enqueued" | "running" | "completed" | "cancelled" | "failed";
+  executions: number;
+  payload: AgentJobPayload | null;
+}
+
+export type CommitResult =
+  | { status: "pending" | "completed"; idempotencyKey: string }
+  | { status: "budget"; reason: string }
+  | { status: "conflict" };
 
 export interface DispatchSpend {
   orgId: string;
@@ -29,6 +59,7 @@ export interface DispatchSpend {
   jobName: AgentJobName;
   iteration: number;
   costUsd: number;
+  payload: AgentJobPayload;
 }
 
 interface MemoryRow {
@@ -44,6 +75,8 @@ interface MemoryRow {
   deadlineAt: string | null;
   approved: Checkpoint[];
   leaseUntil: string | null;
+  executionMode: ExecutionMode;
+  evidenceReady: boolean;
 }
 
 /**
@@ -56,6 +89,8 @@ export class MemoryRunRepository implements RunRepository {
   config: OrgConfig = defaultLabOrgConfig();
   private readonly rows = new Map<string, MemoryRow>();
   private readonly ledgers = new Map<string, CreditLedgerStore>();
+  private readonly outbox = new Map<string, OutboxRow>();
+  private chain: Promise<unknown> = Promise.resolve();
 
   seed(partial: Partial<RunSnapshot> & Pick<RunSnapshot, "id" | "requestId">): RunSnapshot {
     const row: MemoryRow = {
@@ -71,6 +106,8 @@ export class MemoryRunRepository implements RunRepository {
       deadlineAt: partial.deadlineAt ?? null,
       approved: [...(partial.approved ?? [])],
       leaseUntil: null,
+      executionMode: partial.executionMode ?? "simulation",
+      evidenceReady: partial.evidenceReady ?? false,
     };
     this.rows.set(row.id, row);
     return this.view(row);
@@ -110,7 +147,16 @@ export class MemoryRunRepository implements RunRepository {
     }
     row.approved.push(checkpoint);
     row.version += 1;
-    if (checkpoint === "CP3") row.status = "succeeded";
+    if (checkpoint === "CP3") {
+      if (row.executionMode === "live" && row.evidenceReady) {
+        row.status = "succeeded";
+        row.phaseReason = "cp3_approved";
+      } else {
+        row.status = "needs_human";
+        row.phaseReason =
+          row.executionMode === "live" ? "evidence_missing" : "simulation_not_success";
+      }
+    }
   }
 
   async claimDue(limit: number, leaseSeconds: number, now: Date): Promise<RunSnapshot[]> {
@@ -150,27 +196,115 @@ export class MemoryRunRepository implements RunRepository {
     return this.ledgerFor(runId);
   }
 
-  async recordDispatch(input: DispatchSpend): Promise<void> {
-    if (!(input.costUsd > 0)) return;
-    const ledger = this.ledgerFor(input.runId);
-    const reason = dispatchReason(input);
-    if (ledger.list().some((entry) => entry.runId === input.runId && entry.reason === reason)) {
-      return;
-    }
-    ledger.append({
-      id: reason,
-      orgId: input.orgId,
-      requestId: input.requestId,
-      runId: input.runId,
-      role: input.role,
-      provider: "none",
-      model: "stub",
-      inTokens: 0,
-      outTokens: 0,
-      costUsd: input.costUsd,
-      reason,
-      createdAt: new Date(0).toISOString(),
+  async loadSuccess(
+    runId: string,
+    requiredGates: readonly string[],
+  ): Promise<{ executionMode: ExecutionMode; evidenceReady: boolean }> {
+    const row = this.rows.get(runId);
+    const executionMode = row?.executionMode ?? "simulation";
+    const evidenceReady =
+      executionMode === "live" && row?.evidenceReady === true && requiredGates.length > 0;
+    return { executionMode, evidenceReady };
+  }
+
+  async currentDispatch(run: RunSnapshot): Promise<DispatchView> {
+    const spec = agentSpec(run);
+    const idempotencyKey = spec ? dispatchKey(run.id, spec.name, run.iteration) : "";
+    const row = idempotencyKey ? this.outbox.get(idempotencyKey) : undefined;
+    if (!row) return { idempotencyKey, state: "absent", executions: 0, payload: null };
+    return {
+      idempotencyKey,
+      state: row.state,
+      executions: row.executions,
+      payload: row.payload,
+    };
+  }
+
+  async commitDispatch(
+    prev: RunSnapshot,
+    patch: RunPatch,
+    spend: DispatchSpend,
+  ): Promise<CommitResult> {
+    return this.exclusive(() => {
+      const row = this.rows.get(prev.id);
+      if (!row || row.version !== prev.version || row.status !== "active") {
+        return { status: "conflict" };
+      }
+      const key = dispatchKey(prev.id, spend.jobName, spend.iteration);
+      const existing = this.outbox.get(key);
+      if (!(spend.costUsd > 0)) {
+        this.applyHalt(row, {
+          ...patch,
+          status: "needs_human",
+          phaseReason: "unbudgeted_estimate",
+        });
+        return { status: "budget", reason: "unbudgeted_estimate" };
+      }
+      if (!existing) {
+        const ledger = this.ledgerFor(prev.id);
+        const orgConfig = this.config;
+        const orgSpend = ledger.sumOrg(spend.orgId) + spend.costUsd;
+        const runSpend = ledger.sumRun(prev.id) + spend.costUsd;
+        const roleSpend = ledger.sumRole(spend.orgId, prev.id, spend.role) + spend.costUsd;
+        const roleCap = orgConfig.perRoleBudgetUsd[spend.role];
+        if (
+          orgSpend > orgConfig.maxCostUsd ||
+          runSpend > orgConfig.maxCostUsdPerRun ||
+          (roleCap != null && roleSpend > roleCap)
+        ) {
+          this.applyHalt(row, {
+            ...patch,
+            status: "needs_human",
+            phaseReason: "credit_hard_stop",
+          });
+          return { status: "budget", reason: "credit_hard_stop" };
+        }
+        ledger.append({
+          id: dispatchReason(spend),
+          orgId: spend.orgId,
+          requestId: spend.requestId,
+          runId: prev.id,
+          role: spend.role,
+          provider: "none",
+          model: "stub",
+          inTokens: 0,
+          outTokens: 0,
+          costUsd: spend.costUsd,
+          reason: dispatchReason(spend),
+          createdAt: new Date(0).toISOString(),
+        });
+        this.outbox.set(key, {
+          state: "pending",
+          executions: 0,
+          payload: spend.payload,
+        });
+      }
+      this.applyPatch(row, patch);
+      const state = this.outbox.get(key)?.state ?? "pending";
+      return { status: state === "completed" ? "completed" : "pending", idempotencyKey: key };
     });
+  }
+
+  async markEnqueued(idempotencyKey: string): Promise<void> {
+    const row = this.outbox.get(idempotencyKey);
+    if (row && row.state === "pending") row.state = "enqueued";
+  }
+
+  async markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }> {
+    const row = this.outbox.get(idempotencyKey);
+    if (!row || row.state === "completed" || row.state === "cancelled") {
+      return { executed: false };
+    }
+    row.state = "completed";
+    row.executions += 1;
+    return { executed: true };
+  }
+
+  async haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict"> {
+    const row = this.rows.get(prev.id);
+    if (!row || row.version !== prev.version || row.status !== "active") return "conflict";
+    this.applyHalt(row, patch);
+    return "ok";
   }
 
   private ledgerFor(runId: string): InMemoryCreditLedger {
@@ -199,8 +333,58 @@ export class MemoryRunRepository implements RunRepository {
       startedAt: row.startedAt,
       deadlineAt: row.deadlineAt,
       approved: [...row.approved],
+      executionMode: row.executionMode,
+      evidenceReady: row.evidenceReady,
     };
   }
+
+  private exclusive<T>(fn: () => T): Promise<T> {
+    const run = this.chain.then(() => fn());
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private applyPatch(row: MemoryRow, patch: RunPatch): void {
+    row.status = patch.status;
+    row.phase = patch.phase;
+    row.phaseReason = patch.phaseReason;
+    row.iteration = patch.iteration;
+    row.deadlineAt = patch.deadlineAt;
+    row.version += 1;
+    row.leaseUntil = null;
+  }
+
+  private applyHalt(row: MemoryRow, patch: RunPatch): void {
+    this.applyPatch(row, patch);
+    for (const job of this.outbox.values()) {
+      if (
+        job.payload.runId === row.id &&
+        (job.state === "pending" || job.state === "enqueued" || job.state === "running")
+      ) {
+        job.state = "cancelled";
+      }
+    }
+  }
+}
+
+interface OutboxRow {
+  state: "pending" | "enqueued" | "running" | "completed" | "cancelled" | "failed";
+  executions: number;
+  payload: AgentJobPayload;
+}
+
+function dispatchKey(runId: string, name: AgentJobName, iteration: number): string {
+  return agentJobId({ name, runId, iteration });
+}
+
+function agentSpec(run: RunSnapshot): { name: AgentJobName } | null {
+  if (run.phase === "planning") return { name: "plan" };
+  if (run.phase === "coding") return { name: "code" };
+  if (run.phase === "fixing") return { name: "fix" };
+  return null;
 }
 
 export function dispatchReason(input: DispatchSpend): string {

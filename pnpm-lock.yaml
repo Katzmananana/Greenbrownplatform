@@ -116,6 +116,9 @@ importers:
       express:
         specifier: ^4.21.2
         version: 4.22.3
+      pg:
+        specifier: ^8.23.1
+        version: 8.23.1
     devDependencies:
       '@types/express':
         specifier: ^4.17.21

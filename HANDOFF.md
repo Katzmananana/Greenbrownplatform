@@ -18,6 +18,7 @@ Package map:
 | `db/migrations/001_init.sql` | — | `org_config`, `credit_ledger`, `runs`, `approvals`, `deployments` |
 | `db/migrations/002_requests.sql` | — | `requests` (free-text request for MCP `create_run`) |
 | `db/migrations/003_run_phase.sql` | — | `runs.phase` + `phase_reason` for the orchestrator loop. **Apply on lab** (idempotent) |
+| `db/migrations/004_safety.sql` | — | `execution_mode`, `dispatch_outbox`, `run_evidence`, dispatch ledger uniqueness. **Apply on lab before this code** |
 | `.github/workflows/ci.yml` | — | All §7 gates, all blocking |
 | `.github/workflows/promote.yml` | — | CP3 `environment: production` + rollback-on-health-failure |
 
@@ -50,14 +51,20 @@ Tear-down = delete that Railway project.
    - Branch protection on `main` (classic): require PR + require status checks; add `gates-required` after first CI run if it was missing from the search.
    - Environment `Production` with required reviewer Katzmananana; admin bypass off.
 6. ~~MCP milestone~~ **done** on `main` (`073948d`). `POST /mcp` speaks JSON-RPC MCP (`initialize`, `ping`, `tools/list`, `tools/call`) with tools `create_run`, `get_run`, `approve` (CP1→CP2→CP3 in order; CP3 → `succeeded`). `pg` is a gateway dependency; `/health` reports `runStore`. Lab, if a service was not redeployed after that merge: set `GB_MCP_TOKEN` (production returns 503 without it) and apply `db/migrations/002_requests.sql`.
-7. ~~Orchestrator run lifecycle~~ **done for lab scale, partial on real agents** (2026-11-06). The orchestrator polls Postgres and advances `runs.phase`: `queued → planning → awaiting_cp1 → coding → gates → (fixing ↔ gates) → awaiting_cp2 → awaiting_cp3`. Gateway `approve` accepts a checkpoint only in the matching waiting phase. CP3 sets `status=succeeded` only at `awaiting_cp3` (after plan, code, and a green gate pass). Earlier approvals return `not_ready` and do not close the run. Credit hard-stop runs before each dispatch (`needs_human`); a positive `GB_AGENT_ESTIMATE_USD` is written to `credit_ledger` once per dispatch. Failed gates call `decideFixLoop` (`escalated` at the cap). With `REDIS_URL`, jobs `plan` / `code` / `fix` go to BullMQ queue `jobs` and the worker acks them (handlers log only — no Planner or coder yet). Without Redis the loop completes those jobs inline and does not hand them to the worker. Apply `db/migrations/003_run_phase.sql` before expecting phase movement; until that column exists the gateway treats phase as `queued` and rejects every checkpoint. Env: `DATABASE_URL`, `REDIS_URL`, `ORCHESTRATOR_POLL_MS` (2000), `ORCHESTRATOR_LEASE_SECONDS` (30), `ORCHESTRATOR_BATCH` (10), `GB_AGENT_ESTIMATE_USD` (0), `GB_GATES_FAIL` (comma-separated stub gate names).
-8. Next: real Planner and coding agent (Cursor key is already on the lab services; no Grok/Anthropic keys), real CI gate execution instead of the logic-only stub, JWT / `auth_time` on approvals, admin UI. The orchestrator does not promote to production.
+7. ~~Orchestrator run lifecycle~~ **lab scale, safety scaffolding in PR #3, not a real change-request success path**. Phases: `queued → planning → awaiting_cp1 → coding → gates → (fixing ↔ gates) → awaiting_cp2 → awaiting_cp3`. CP1/CP2/CP3 are accepted only in the matching phase. The agent bearer cannot approve. `approve` requires `X-GB-Human-Authorization` (HS256 JWT with `sub`, `auth_time`, `exp`) signed by `GB_HUMAN_APPROVAL_SECRET`. `auth_time` is stored from the token and must be newer than `GB_HUMAN_AUTH_MAX_AGE_SECONDS` (default 300). Unset secret fails closed. This repo does not issue that JWT; wire it to the human IdP when Auth.js lands. Do not commit a production secret. CP3 sets `succeeded` only when `execution_mode=live` and `run_evidence` has an artifact plus verified passes of every required gate for the same `commit_sha`. Stub/inline runs stay `simulation` and CP3 ends `needs_human` / `simulation_not_success`. `GB_AGENT_ESTIMATE_USD` must be > 0 or the dispatch is `unbudgeted_estimate` and is not enqueued. The estimate, outbox row, and phase change commit in one transaction under `pg_advisory_xact_lock`. A missing Redis job for a still-open outbox row is enqueued again without a second charge. A completed outbox row is not executed again. Fix-loop cap and wall-clock timeout set a terminal status and cancel open dispatches. Apply `003_run_phase.sql` and `004_safety.sql` before deploy. Env: `DATABASE_URL`, `REDIS_URL`, `GB_MCP_TOKEN`, `GB_HUMAN_APPROVAL_SECRET`, `GB_HUMAN_AUTH_MAX_AGE_SECONDS`, `GB_AGENT_ESTIMATE_USD` (> 0), `ORCHESTRATOR_POLL_MS`, `ORCHESTRATOR_LEASE_SECONDS`, `ORCHESTRATOR_BATCH`, `GB_GATES_FAIL`.
+8. Next: real Planner/coder that can set `execution_mode=live` only together with a real artifact and verified same-commit gate evidence; Auth.js as the human JWT issuer; admin UI. No Grok/Anthropic keys. The orchestrator does not promote to production.
+
+Limitation, not a claim of exactly-once external execution: the worker increments `dispatch_outbox.executions` and sets `running` before the stub handler, then sets `completed` after it. A second delivery does not run the handler. A crash after `running` and before `completed` does not re-run the handler either (at-most-once for this stub). A future model call must use the same idempotency key itself. Redis remains transport only.
 
 ## Local verification
 
 ```bash
 pnpm install && pnpm -r build
-pnpm test:unit                    # credits, gates, orchestrator lifecycle, worker handoff
-pnpm --filter @gb/gateway start   # http://127.0.0.1:3000/health
-pnpm --filter @gb/orchestrator start  # :3001/health — loop idles until DATABASE_URL is set
+pnpm test:unit                    # in-memory lifecycle; CI runs this, not the database suite
+# Real Postgres + Redis (local only; not Railway, not GitHub CI):
+GB_TEST_DATABASE_URL='postgresql:///gb_safety?host=/var/run/postgresql' \
+GB_TEST_REDIS_URL='redis://127.0.0.1:6379/1' \
+  pnpm --filter @gb/orchestrator exec vitest run test/safety.integration.test.ts
 ```
+
+The safety integration test is skipped when those URLs are unset. A skip is not a pass of that suite.

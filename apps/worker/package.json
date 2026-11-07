@@ -13,7 +13,8 @@
   "dependencies": {
     "@gb/shared": "workspace:*",
     "bullmq": "^5.34.5",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

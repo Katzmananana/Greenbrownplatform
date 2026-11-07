@@ -4,6 +4,7 @@ export interface BullmqConnection {
   port: number;
   username?: string;
   password?: string;
+  db?: number;
   tls?: Record<string, never>;
   maxRetriesPerRequest: null;
 }
@@ -18,5 +19,9 @@ export function bullmqConnectionFromUrl(urlStr: string): BullmqConnection {
   if (url.username) connection.username = decodeURIComponent(url.username);
   if (url.password) connection.password = decodeURIComponent(url.password);
   if (url.protocol === "rediss:") connection.tls = {};
+  if (url.pathname && url.pathname !== "/") {
+    const db = Number(url.pathname.slice(1));
+    if (Number.isInteger(db) && db >= 0) connection.db = db;
+  }
   return connection;
 }

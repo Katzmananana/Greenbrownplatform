@@ -21,6 +21,8 @@ function run(partial: Partial<RunSnapshot> = {}): RunSnapshot {
     startedAt: NOW.toISOString(),
     deadlineAt: null,
     approved: [],
+    executionMode: "simulation",
+    evidenceReady: false,
     ...partial,
   };
 }
@@ -158,8 +160,21 @@ describe("stepRun", () => {
     );
     expect(afterGates.patch).toMatchObject({ status: "active", phase: "awaiting_cp3" });
 
-    const succeeded = stepRun(
+    const simulated = stepRun(
       run({ phase: "awaiting_cp3", approved: ["CP1", "CP2", "CP3"] }),
+      ctx(),
+    );
+    expect(simulated.patch).toMatchObject({
+      status: "needs_human",
+      phaseReason: "simulation_not_success",
+    });
+    const succeeded = stepRun(
+      run({
+        phase: "awaiting_cp3",
+        approved: ["CP1", "CP2", "CP3"],
+        executionMode: "live",
+        evidenceReady: true,
+      }),
       ctx(),
     );
     expect(succeeded.patch).toMatchObject({ status: "succeeded", phaseReason: "cp3_approved" });

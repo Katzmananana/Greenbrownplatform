@@ -1,4 +1,4 @@
-import type { Checkpoint, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
+import type { Checkpoint, ExecutionMode, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
 
 /** Run row the lifecycle loop claims. `approved` is the gateway approval set. */
 export interface RunSnapshot {
@@ -13,6 +13,9 @@ export interface RunSnapshot {
   startedAt: string;
   deadlineAt: string | null;
   approved: readonly Checkpoint[];
+  executionMode: ExecutionMode;
+  /** True only when decideRunSuccess would accept this run. */
+  evidenceReady: boolean;
 }
 
 /** Fields written by one successful transition. Version is bumped by the repo. */

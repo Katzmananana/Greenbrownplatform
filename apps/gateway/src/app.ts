@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import { CreditGuard, defaultLabOrgConfig, InMemoryCreditLedger } from "@gb/credits";
 import { type McpAuthConfig, mcpAuthMiddleware } from "./mcp/auth.js";
+import { type HumanAuthConfig, readHumanAuthConfig } from "./mcp/human-auth.js";
 import { JSONRPC_ERRORS, handleJsonRpc, rpcError } from "./mcp/server.js";
 import { creditHardStopMiddleware } from "./middleware/credits.js";
 import { InMemoryRunStore } from "./store/memory.js";
@@ -13,6 +14,8 @@ export interface GatewayOptions {
   runStore?: RunStore;
   /** Defaults to { token: GB_MCP_TOKEN, nodeEnv: NODE_ENV }. */
   mcpAuth?: McpAuthConfig;
+  /** Human approval JWT. Unset secret fails approve closed. */
+  humanAuth?: HumanAuthConfig;
 }
 
 export function createApp(options: GatewayOptions = {}): Express {
@@ -23,6 +26,10 @@ export function createApp(options: GatewayOptions = {}): Express {
   const mcpAuth = options.mcpAuth ?? {
     token: process.env.GB_MCP_TOKEN,
     nodeEnv: process.env.NODE_ENV,
+  };
+  const humanAuth = options.humanAuth ?? {
+    ...readHumanAuthConfig(),
+    agentCredential: mcpAuth.token,
   };
   const app = express();
   app.disable("x-powered-by");
@@ -54,6 +61,8 @@ export function createApp(options: GatewayOptions = {}): Express {
           store: runStore,
           principal: String(res.locals.mcpPrincipal ?? "anonymous"),
           ip: req.ip ?? null,
+          humanAuthorization: req.header("x-gb-human-authorization") ?? null,
+          humanAuth,
         });
         if (response === null) {
           res.status(202).end();

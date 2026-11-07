@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { RunPhase } from "@gb/shared";
+import { decideRunSuccess, type ExecutionMode, type RunPhase } from "@gb/shared";
 import type { ApproveInput, CreateRunInput, RunRecord, RunStore } from "./types.js";
 import { RunStoreError } from "./types.js";
 import { assertCanApprove, stageFor, statusAfterApproval } from "./workflow.js";
@@ -10,6 +10,14 @@ type StoredRun = Omit<RunRecord, "stage">;
 export class InMemoryRunStore implements RunStore {
   readonly kind = "memory" as const;
   private readonly runs = new Map<string, StoredRun>();
+  private readonly evidence = new Map<
+    string,
+    {
+      artifactCommitSha: string;
+      verifiedPassedGates: string[];
+      requiredGates: string[];
+    }
+  >();
 
   async createRun(input: CreateRunInput): Promise<RunRecord> {
     const run: StoredRun = {
@@ -18,6 +26,9 @@ export class InMemoryRunStore implements RunStore {
       request: input.request,
       status: "active",
       phase: "queued",
+      phaseReason: null,
+      executionMode: "simulation",
+      commitSha: null,
       iteration: 0,
       version: 1,
       startedAt: new Date().toISOString(),
@@ -38,6 +49,12 @@ export class InMemoryRunStore implements RunStore {
     if (!run) {
       throw new RunStoreError("not_found", `run ${input.runId} not found`);
     }
+    if (!input.userId.trim() || !input.authTime) {
+      throw new RunStoreError(
+        "human_auth_required",
+        "approve requires a verified human user id and auth_time",
+      );
+    }
     assertCanApprove(
       {
         runId: run.runId,
@@ -47,7 +64,7 @@ export class InMemoryRunStore implements RunStore {
       },
       input.checkpoint,
     );
-    const at = new Date().toISOString();
+    const at = input.authTime;
     run.approvals.push({
       checkpoint: input.checkpoint,
       decision: "approved",
@@ -55,10 +72,29 @@ export class InMemoryRunStore implements RunStore {
       comment: input.comment ?? null,
       at,
     });
-    run.status = statusAfterApproval(run.status, input.checkpoint);
+    const success = this.successFor(run);
+    run.status = statusAfterApproval(run.status, input.checkpoint, success.ok);
+    if (input.checkpoint === "CP3" && !success.ok) run.phaseReason = success.reason;
+    if (input.checkpoint === "CP3" && success.ok) run.phaseReason = "cp3_approved";
     if (run.status !== "active") run.endedAt = at;
     run.version += 1;
     return view(run);
+  }
+
+  /** Test fixture only. The stub orchestrator never flips a run to live. */
+  setLiveEvidence(
+    runId: string,
+    input: { commitSha: string; requiredGates: readonly string[] },
+  ): void {
+    const run = this.runs.get(runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    run.executionMode = "live";
+    run.commitSha = input.commitSha;
+    this.evidence.set(runId, {
+      artifactCommitSha: input.commitSha,
+      verifiedPassedGates: [...input.requiredGates],
+      requiredGates: [...input.requiredGates],
+    });
   }
 
   /**
@@ -69,6 +105,17 @@ export class InMemoryRunStore implements RunStore {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     run.phase = phase;
+  }
+
+  private successFor(run: StoredRun): { ok: true } | { ok: false; reason: string } {
+    const evidence = this.evidence.get(run.runId);
+    return decideRunSuccess({
+      executionMode: run.executionMode,
+      commitSha: run.commitSha,
+      artifactCommitSha: evidence?.artifactCommitSha ?? null,
+      verifiedPassedGates: evidence?.verifiedPassedGates ?? [],
+      requiredGates: evidence?.requiredGates ?? [],
+    });
   }
 }
 

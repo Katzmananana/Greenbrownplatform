@@ -1,9 +1,22 @@
-import type { Checkpoint, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
-import { RUN_PHASES } from "@gb/shared";
+import type {
+  AgentJobPayload,
+  Checkpoint,
+  ExecutionMode,
+  OrgConfig,
+  RunPhase,
+  RunStatus,
+} from "@gb/shared";
+import { RUN_PHASES, agentJobId, decideRunSuccess } from "@gb/shared";
 import type { CreditLedgerStore } from "@gb/credits";
 import { defaultLabOrgConfig } from "@gb/credits";
 import { configFromOrgRow, ledgerFromSums, type SpendSums } from "./credits.js";
-import { dispatchReason, type DispatchSpend, type RunRepository } from "./repo.js";
+import {
+  dispatchReason,
+  type CommitResult,
+  type DispatchSpend,
+  type DispatchView,
+  type RunRepository,
+} from "./repo.js";
 import type { RunPatch, RunSnapshot } from "./types.js";
 
 /** The subset of `pg` this process uses. Compiles without `@types/pg`. */
@@ -65,7 +78,7 @@ SET lease_until = now() + ($2::int * interval '1 second'),
 FROM due
 WHERE u.id = due.id
 RETURNING u.id, u.request_id, u.status, u.phase, u.phase_reason, u.iteration,
-          u.version, u.started_at, u.deadline_at`;
+          u.version, u.started_at, u.deadline_at, u.execution_mode, u.commit_sha`;
 
 export const SAVE_SQL = `
 UPDATE runs
@@ -99,6 +112,8 @@ export function rowToSnapshot(
     startedAt: toIso(row.started_at) ?? new Date(0).toISOString(),
     deadlineAt: toIso(row.deadline_at),
     approved,
+    executionMode: row.execution_mode === "live" ? "live" : "simulation",
+    evidenceReady: false,
   };
 }
 
@@ -212,9 +227,270 @@ export class PostgresRunRepository implements RunRepository {
     return ledgerFromSums(orgId, runId, sums);
   }
 
+  async currentDispatch(run: RunSnapshot): Promise<DispatchView> {
+    const spec =
+      run.phase === "planning"
+        ? "plan"
+        : run.phase === "coding"
+          ? "code"
+          : run.phase === "fixing"
+            ? "fix"
+            : null;
+    if (!spec) return { idempotencyKey: "", state: "absent", executions: 0, payload: null };
+    const idempotencyKey = agentJobId({ name: spec, runId: run.id, iteration: run.iteration });
+    const { rows } = await this.pool.query(
+      `SELECT state, executions, payload FROM dispatch_outbox WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    const row = rows[0];
+    if (!row) return { idempotencyKey, state: "absent", executions: 0, payload: null };
+    return {
+      idempotencyKey,
+      state: row.state,
+      executions: Number(row.executions),
+      payload: row.payload as AgentJobPayload,
+    };
+  }
+
+  async loadSuccess(
+    runId: string,
+    requiredGates: readonly string[],
+  ): Promise<{ executionMode: ExecutionMode; evidenceReady: boolean }> {
+    const run = await this.pool.query(`SELECT execution_mode, commit_sha FROM runs WHERE id = $1`, [
+      runId,
+    ]);
+    const mode: ExecutionMode = run.rows[0]?.execution_mode === "live" ? "live" : "simulation";
+    const commitSha = run.rows[0]?.commit_sha == null ? null : String(run.rows[0].commit_sha);
+    const evidence = await this.pool.query(
+      `SELECT kind, gate_name, mode, passed, commit_sha FROM run_evidence WHERE run_id = $1`,
+      [runId],
+    );
+    let artifactCommitSha: string | null = null;
+    const verified: string[] = [];
+    for (const item of evidence.rows) {
+      if (String(item.commit_sha) !== commitSha) continue;
+      if (item.kind === "artifact") artifactCommitSha = commitSha;
+      if (
+        item.kind === "gate" &&
+        item.mode === "verified" &&
+        item.passed === true &&
+        item.gate_name
+      ) {
+        verified.push(String(item.gate_name));
+      }
+    }
+    const decision = decideRunSuccess({
+      executionMode: mode,
+      commitSha,
+      artifactCommitSha,
+      verifiedPassedGates: verified,
+      requiredGates,
+    });
+    return { executionMode: mode, evidenceReady: decision.ok };
+  }
+
+  async commitDispatch(
+    prev: RunSnapshot,
+    patch: RunPatch,
+    spend: DispatchSpend,
+  ): Promise<CommitResult> {
+    if (!isUuid(spend.orgId)) {
+      const halted = await this.haltRun(prev, {
+        ...patch,
+        status: "needs_human",
+        phaseReason: "org_id_invalid",
+      });
+      return halted === "ok"
+        ? { status: "budget", reason: "org_id_invalid" }
+        : { status: "conflict" };
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, [
+        spend.orgId,
+      ]);
+      const locked = await client.query(
+        `SELECT version, status FROM runs WHERE id = $1::uuid FOR UPDATE`,
+        [prev.id],
+      );
+      const current = locked.rows[0];
+      if (!current || Number(current.version) !== prev.version || current.status !== "active") {
+        await client.query("ROLLBACK");
+        return { status: "conflict" };
+      }
+      const key = agentJobId({ name: spend.jobName, runId: prev.id, iteration: spend.iteration });
+      if (!(spend.costUsd > 0)) {
+        await writeHalt(client, prev, patch, "unbudgeted_estimate");
+        await client.query("COMMIT");
+        return { status: "budget", reason: "unbudgeted_estimate" };
+      }
+      const existing = await client.query(
+        `SELECT state FROM dispatch_outbox WHERE idempotency_key = $1`,
+        [key],
+      );
+      if (existing.rows.length === 0) {
+        const config = await this.loadConfig();
+        const sums = await lockedSums(client, spend.orgId, prev.id, spend.role);
+        const roleCap = config.perRoleBudgetUsd[spend.role];
+        const over =
+          sums.org + spend.costUsd > config.maxCostUsd ||
+          sums.run + spend.costUsd > config.maxCostUsdPerRun ||
+          (roleCap != null && sums.role + spend.costUsd > roleCap);
+        if (over) {
+          await writeHalt(client, prev, patch, "credit_hard_stop");
+          await client.query("COMMIT");
+          return { status: "budget", reason: "credit_hard_stop" };
+        }
+        const requestId = isUuid(spend.requestId) ? spend.requestId : null;
+        await client.query(
+          `INSERT INTO credit_ledger
+             (org_id, request_id, run_id, role, provider, model, in_tokens, out_tokens, cost_usd, reason)
+           VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'none', 'stub', 0, 0, $5, $6)`,
+          [spend.orgId, requestId, prev.id, spend.role, spend.costUsd, dispatchReason(spend)],
+        );
+        await client.query(
+          `INSERT INTO dispatch_outbox
+             (idempotency_key, org_id, run_id, request_id, job_name, role, iteration, payload, cost_usd, state)
+           VALUES ($1, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8::jsonb, $9, 'pending')`,
+          [
+            key,
+            spend.orgId,
+            prev.id,
+            requestId,
+            spend.jobName,
+            spend.role,
+            spend.iteration,
+            JSON.stringify(spend.payload),
+            spend.costUsd,
+          ],
+        );
+      }
+      await writePhase(client, prev, patch);
+      await client.query("COMMIT");
+      const state = String(existing.rows[0]?.state ?? "pending");
+      return {
+        status: state === "completed" ? "completed" : "pending",
+        idempotencyKey: key,
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async markEnqueued(idempotencyKey: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE dispatch_outbox
+       SET state = 'enqueued', enqueued_at = COALESCE(enqueued_at, now())
+       WHERE idempotency_key = $1 AND state = 'pending'`,
+      [idempotencyKey],
+    );
+  }
+
+  async markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }> {
+    const { rows } = await this.pool.query(
+      `UPDATE dispatch_outbox
+       SET state = 'completed', completed_at = now()
+       WHERE idempotency_key = $1 AND state = 'running'
+       RETURNING executions`,
+      [idempotencyKey],
+    );
+    return { executed: rows.length > 0 };
+  }
+
+  async haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict"> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const updated = await writeHalt(client, prev, patch, patch.phaseReason ?? "halted");
+      if (!updated) {
+        await client.query("ROLLBACK");
+        return "conflict";
+      }
+      await client.query("COMMIT");
+      return "ok";
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }
+}
+
+async function writePhase(client: PgQueryable, prev: RunSnapshot, patch: RunPatch): Promise<void> {
+  await client.query(
+    `UPDATE runs
+     SET phase = $3, phase_reason = $4, iteration = $5, status = $6, deadline_at = $7,
+         ended_at = CASE WHEN $6 = 'active' THEN ended_at ELSE COALESCE(ended_at, now()) END,
+         heartbeat_at = now(), lease_until = NULL, version = version + 1
+     WHERE id = $1::uuid AND version = $2 AND status = 'active'`,
+    [
+      prev.id,
+      prev.version,
+      patch.phase,
+      patch.phaseReason,
+      patch.iteration,
+      patch.status,
+      patch.deadlineAt,
+    ],
+  );
+}
+
+async function writeHalt(
+  client: PgQueryable,
+  prev: RunSnapshot,
+  patch: RunPatch,
+  reason: string,
+): Promise<boolean> {
+  const { rows } = await client.query(
+    `UPDATE runs
+     SET status = $3, phase = $4, phase_reason = $5, iteration = $6, deadline_at = $7,
+         ended_at = COALESCE(ended_at, now()), heartbeat_at = now(), lease_until = NULL,
+         version = version + 1
+     WHERE id = $1::uuid AND version = $2 AND status = 'active'
+     RETURNING id`,
+    [prev.id, prev.version, patch.status, patch.phase, reason, patch.iteration, patch.deadlineAt],
+  );
+  await client.query(
+    `UPDATE dispatch_outbox SET state = 'cancelled'
+     WHERE run_id = $1::uuid AND state IN ('pending', 'enqueued', 'running')`,
+    [prev.id],
+  );
+  return rows.length > 0;
+}
+
+async function lockedSums(
+  client: PgQueryable,
+  orgId: string,
+  runId: string,
+  role: string,
+): Promise<{ org: number; run: number; role: number }> {
+  const org = await client.query(
+    `SELECT COALESCE(SUM(cost_usd), 0)::float8 AS usd FROM credit_ledger WHERE org_id = $1::uuid`,
+    [orgId],
+  );
+  const run = await client.query(
+    `SELECT COALESCE(SUM(cost_usd), 0)::float8 AS usd FROM credit_ledger WHERE run_id = $1::uuid`,
+    [runId],
+  );
+  const byRole = await client.query(
+    `SELECT COALESCE(SUM(cost_usd), 0)::float8 AS usd FROM credit_ledger
+     WHERE org_id = $1::uuid AND run_id = $2::uuid AND role = $3`,
+    [orgId, runId, role],
+  );
+  return {
+    org: Number(org.rows[0]?.usd ?? 0),
+    run: Number(run.rows[0]?.usd ?? 0),
+    role: Number(byRole.rows[0]?.usd ?? 0),
+  };
 }
 
 export async function createPostgresRepository(
@@ -311,7 +587,9 @@ async function roleSums(
 function describeSchemaError(err: unknown): Error {
   const code = pgCode(err);
   if (code === "42703") {
-    return new Error("runs.phase is missing — apply db/migrations/003_run_phase.sql");
+    return new Error(
+      "runs.phase or runs.execution_mode is missing — apply db/migrations/003_run_phase.sql and 004_safety.sql",
+    );
   }
   if (code === "42P01") {
     return new Error("runs table is missing — apply db/migrations/001_init.sql");
