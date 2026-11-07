@@ -30,12 +30,10 @@ export function agentSpecForPhase(phase: RunPhase): AgentSpec | null {
 /**
  * One transition of an active run.
  *
- * Gateway owns approvals and the CP3 → succeeded write. This function never
- * inserts an approval and never reorders CP1/CP2/CP3. It only observes
- * `approved`. If CP3 is already approved while the row is still active, it
- * heals status to succeeded — the same end state `approve` commits.
- * Callers must CAS the save on `version` and `status = 'active'` so a
- * concurrent CP3 approval wins.
+ * Gateway owns approvals. CP3 may set `succeeded` only while phase is
+ * `awaiting_cp3`, which this machine reaches after planning, coding, and a
+ * green gate pass. Approvals already stored do not skip that work and do not
+ * close the run early. Callers CAS the save on `version` and `status = 'active'`.
  */
 export function stepRun(run: RunSnapshot, ctx: StepContext): StepOutcome {
   if (run.status !== "active") return HOLD;
@@ -59,7 +57,6 @@ export function stepRun(run: RunSnapshot, ctx: StepContext): StepOutcome {
       return onGates(run, ctx, deadlineAt);
     case "awaiting_cp2":
       if (!run.approved.includes("CP2")) return HOLD;
-      if (run.approved.includes("CP3")) return succeed(run, deadlineAt);
       return move(run, "awaiting_cp3", deadlineAt);
     case "awaiting_cp3":
       if (!run.approved.includes("CP3")) return HOLD;
@@ -76,6 +73,7 @@ function onAgentPhase(run: RunSnapshot, ctx: StepContext, deadlineAt: string): S
   if (state === "failed") return onAgentFailed(run, ctx, deadlineAt);
   const spec = agentSpecForPhase(run.phase);
   if (!spec) return HOLD;
+  // Same dispatch as the one already charged. Do not apply the estimate again.
   return startAgent(run, ctx, spec, run.iteration, deadlineAt, null, true);
 }
 
@@ -113,7 +111,6 @@ function onGates(run: RunSnapshot, ctx: StepContext, deadlineAt: string): StepOu
 
 function afterGreenGates(run: RunSnapshot, deadlineAt: string): StepOutcome {
   if (!run.approved.includes("CP2")) return move(run, "awaiting_cp2", deadlineAt);
-  if (run.approved.includes("CP3")) return succeed(run, deadlineAt);
   return move(run, "awaiting_cp3", deadlineAt);
 }
 
@@ -126,8 +123,10 @@ function startAgent(
   phaseReason: string | null,
   keepPhase = false,
 ): StepOutcome {
-  const spend = ctx.assertSpend(spec.role);
-  if (!spend.ok) return halt(run, "needs_human", spend.message, deadlineAt);
+  if (!keepPhase) {
+    const spend = ctx.assertSpend(spec.role);
+    if (!spend.ok) return halt(run, "needs_human", spend.message, deadlineAt);
+  }
   const enqueue: AgentJobPayload = {
     v: 1,
     name: spec.name,

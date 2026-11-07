@@ -137,8 +137,12 @@ describe("stepRun", () => {
     expect(afterCode.enqueue).toBeNull();
   });
 
-  it("moves a green gate run to CP2, then CP3, and heals succeeded if CP3 is already stored", () => {
+  it("does not declare success from stored CP3 until gates have passed and phase is awaiting_cp3", () => {
     const pass = [gateResult("unit", true, "ok")];
+    const stillPlanning = stepRun(run({ phase: "queued", approved: ["CP1", "CP2", "CP3"] }), ctx());
+    expect(stillPlanning.patch).toMatchObject({ status: "active", phase: "planning" });
+    expect(stillPlanning.enqueue?.name).toBe("plan");
+
     const toCp2 = stepRun(run({ phase: "gates", approved: ["CP1"] }), ctx({ gates: pass }));
     expect(toCp2.patch).toMatchObject({ status: "active", phase: "awaiting_cp2" });
 
@@ -148,11 +152,17 @@ describe("stepRun", () => {
     const toCp3 = stepRun(run({ phase: "awaiting_cp2", approved: ["CP1", "CP2"] }), ctx());
     expect(toCp3.patch).toMatchObject({ status: "active", phase: "awaiting_cp3" });
 
-    const healed = stepRun(
+    const afterGates = stepRun(
       run({ phase: "gates", approved: ["CP1", "CP2", "CP3"] }),
       ctx({ gates: pass }),
     );
-    expect(healed.patch).toMatchObject({ status: "succeeded", phaseReason: "cp3_approved" });
+    expect(afterGates.patch).toMatchObject({ status: "active", phase: "awaiting_cp3" });
+
+    const succeeded = stepRun(
+      run({ phase: "awaiting_cp3", approved: ["CP1", "CP2", "CP3"] }),
+      ctx(),
+    );
+    expect(succeeded.patch).toMatchObject({ status: "succeeded", phaseReason: "cp3_approved" });
   });
 
   it("retries a failed gate via decideFixLoop, then escalates at the cap", () => {

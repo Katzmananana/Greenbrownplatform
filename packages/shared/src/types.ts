@@ -14,8 +14,8 @@ export type RunStatus =
 /**
  * Orchestrator lifecycle. This is not the gateway checkpoint stage
  * (`awaiting_cp1` … `approved`), which is derived only from approvals.
- * `status` stays `active` while a human checkpoint is pending so MCP `approve`
- * can still move CP1 → CP2 → CP3. CP3 itself sets `status` to `succeeded`.
+ * `status` stays `active` until CP3 is approved at `awaiting_cp3`, which is only
+ * reached after planning, coding, and gates. Earlier checkpoints do not close the run.
  */
 export const RUN_PHASES = [
   "queued",

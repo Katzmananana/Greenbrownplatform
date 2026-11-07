@@ -3,7 +3,7 @@ import { RUN_PHASES } from "@gb/shared";
 import type { CreditLedgerStore } from "@gb/credits";
 import { defaultLabOrgConfig } from "@gb/credits";
 import { configFromOrgRow, ledgerFromSums, type SpendSums } from "./credits.js";
-import type { RunRepository } from "./repo.js";
+import { dispatchReason, type DispatchSpend, type RunRepository } from "./repo.js";
 import type { RunPatch, RunSnapshot } from "./types.js";
 
 /** The subset of `pg` this process uses. Compiles without `@types/pg`. */
@@ -172,6 +172,29 @@ export class PostgresRunRepository implements RunRepository {
     return configFromOrgRow(row);
   }
 
+  async recordDispatch(input: DispatchSpend): Promise<void> {
+    if (!(input.costUsd > 0)) return;
+    if (!isUuid(input.orgId) || !isUuid(input.runId)) return;
+    const reason = dispatchReason(input);
+    const requestId = isUuid(input.requestId) ? input.requestId : null;
+    try {
+      const existing = await this.pool.query(
+        `SELECT 1 FROM credit_ledger WHERE run_id = $1::uuid AND reason = $2 LIMIT 1`,
+        [input.runId, reason],
+      );
+      if (existing.rows.length > 0) return;
+      await this.pool.query(
+        `INSERT INTO credit_ledger
+           (org_id, request_id, run_id, role, provider, model, in_tokens, out_tokens, cost_usd, reason)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'none', 'stub', 0, 0, $5, $6)`,
+        [input.orgId, requestId, input.runId, input.role, input.costUsd, reason],
+      );
+    } catch (err) {
+      if (pgCode(err) === "22P02" || pgCode(err) === "42P01") return;
+      throw err;
+    }
+  }
+
   async loadLedger(orgId: string, runId: string): Promise<CreditLedgerStore> {
     const sums: SpendSums = {
       orgUsd: await scalar(
@@ -294,6 +317,12 @@ function describeSchemaError(err: unknown): Error {
     return new Error("runs table is missing — apply db/migrations/001_init.sql");
   }
   return err instanceof Error ? err : new Error(String(err));
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
 }
 
 function pgCode(err: unknown): string | undefined {

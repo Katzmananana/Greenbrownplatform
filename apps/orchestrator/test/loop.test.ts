@@ -97,34 +97,56 @@ describe("run lifecycle loop", () => {
     expect(repo.get(RUN_ID)?.phase).toBe("awaiting_cp3");
   });
 
-  it("still plans when CP1 arrived early, then codes without parking", async () => {
+  it("rejects CP1 before planning finishes and does not mark the run succeeded", async () => {
     const { repo, jobs, tick } = harness();
     seed(repo);
-    repo.recordGatewayApproval(RUN_ID, "CP1");
+    expect(() => repo.recordGatewayApproval(RUN_ID, "CP1")).toThrow(/not_ready/);
+    expect(repo.get(RUN_ID)).toMatchObject({ status: "active", phase: "queued" });
 
-    await tick();
-    expect(repo.get(RUN_ID)?.phase).toBe("planning");
-    jobs.mark({ name: "plan", runId: RUN_ID, iteration: 0 }, "completed");
-    await tick();
-    expect(repo.get(RUN_ID)?.phase).toBe("coding");
-    expect(jobs.jobs.has(agentJobId({ name: "code", runId: RUN_ID, iteration: 0 }))).toBe(true);
-  });
-
-  it("does not enqueue when gateway CP3 commits before the transition save", async () => {
-    const { repo, jobs, tick } = harness();
-    seed(repo);
     const original = repo.save.bind(repo);
     repo.save = async (prev, patch) => {
-      repo.recordGatewayApproval(prev.id, "CP1");
-      repo.recordGatewayApproval(prev.id, "CP2");
-      repo.recordGatewayApproval(prev.id, "CP3");
+      expect(() => repo.recordGatewayApproval(prev.id, "CP1")).toThrow(/not_ready/);
       return original(prev, patch);
     };
-
     const stats = await tick();
-    expect(stats).toMatchObject({ conflicts: 1, enqueued: 0, saved: 0 });
-    expect(repo.get(RUN_ID)).toMatchObject({ status: "succeeded", phase: "queued" });
-    expect(jobs.jobs.size).toBe(0);
+    expect(stats.enqueued).toBe(1);
+    expect(repo.get(RUN_ID)).toMatchObject({ status: "active", phase: "planning" });
+    expect(jobs.jobs.size).toBe(1);
+  });
+
+  it("records each new dispatch once and hard-stops the next one at the run cap", async () => {
+    const { repo, jobs } = harness();
+    repo.config = defaultLabOrgConfig({
+      maxCostUsd: 100,
+      maxCostUsdPerRun: 10,
+      perRoleBudgetUsd: { planner: 100, coder: 100, fixer: 100, reviewer: 100, reporter: 100 },
+    });
+    seed(repo);
+    const tick = () =>
+      runTick({
+        repo,
+        jobs,
+        now: NOW,
+        leaseSeconds: 30,
+        batchSize: 10,
+        estimateUsd: 6,
+      });
+
+    expect((await tick()).enqueued).toBe(1);
+    expect((await repo.loadLedger(repo.config.orgId, RUN_ID)).sumRun(RUN_ID)).toBe(6);
+    const planId = agentJobId({ name: "plan", runId: RUN_ID, iteration: 0 });
+    jobs.jobs.delete(planId);
+    expect((await tick()).enqueued).toBe(1);
+    expect((await repo.loadLedger(repo.config.orgId, RUN_ID)).sumRun(RUN_ID)).toBe(6);
+
+    jobs.mark({ name: "plan", runId: RUN_ID, iteration: 0 }, "completed");
+    expect((await tick()).saved).toBe(1);
+    expect(repo.get(RUN_ID)?.phase).toBe("awaiting_cp1");
+    repo.recordGatewayApproval(RUN_ID, "CP1");
+    const stopped = await tick();
+    expect(stopped.enqueued).toBe(0);
+    expect(repo.get(RUN_ID)).toMatchObject({ status: "needs_human", phase: "awaiting_cp1" });
+    expect((await repo.loadLedger(repo.config.orgId, RUN_ID)).sumRun(RUN_ID)).toBe(6);
   });
 
   it("stops an already over-budget run before enqueueing", async () => {

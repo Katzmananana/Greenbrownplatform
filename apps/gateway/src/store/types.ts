@@ -1,4 +1,4 @@
-import type { Checkpoint, RunStatus } from "@gb/shared";
+import type { Checkpoint, RunPhase, RunStatus } from "@gb/shared";
 
 /** Where a run sits in the CP1 → CP2 → CP3 human-checkpoint sequence. */
 export type RunStage = "awaiting_cp1" | "awaiting_cp2" | "awaiting_cp3" | "approved";
@@ -16,6 +16,8 @@ export interface RunRecord {
   requestId: string;
   request: string | null;
   status: RunStatus;
+  /** Orchestrator lifecycle. Distinct from `stage`, which is the next human checkpoint. */
+  phase: RunPhase;
   stage: RunStage;
   iteration: number;
   version: number;
@@ -48,7 +50,8 @@ export type RunStoreErrorCode =
   | "not_found"
   | "out_of_order"
   | "already_approved"
-  | "run_not_active";
+  | "run_not_active"
+  | "not_ready";
 
 export class RunStoreError extends Error {
   readonly code: RunStoreErrorCode;

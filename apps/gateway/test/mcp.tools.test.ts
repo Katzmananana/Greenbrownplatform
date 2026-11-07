@@ -13,10 +13,12 @@ import { InMemoryRunStore } from "../src/store/memory.js";
 import { createRunStoreFromEnv } from "../src/store/index.js";
 import { nextCheckpoint, stageFor } from "../src/store/workflow.js";
 
+let store: InMemoryRunStore;
 let ctx: ToolContext;
 
 beforeEach(() => {
-  ctx = { store: new InMemoryRunStore(), principal: "bearer:test", ip: "127.0.0.1" };
+  store = new InMemoryRunStore();
+  ctx = { store, principal: "bearer:test", ip: "127.0.0.1" };
 });
 
 async function newRunId(): Promise<string> {
@@ -38,6 +40,7 @@ describe("create_run", () => {
   it("creates an active run awaiting CP1", async () => {
     const out = await createRunTool({ request: "  add a /status page  " }, ctx);
     expect(out.status).toBe("active");
+    expect(out.phase).toBe("queued");
     expect(out.stage).toBe("awaiting_cp1");
     expect(typeof out.runId).toBe("string");
     const run = await ctx.store.getRun(String(out.runId));
@@ -73,16 +76,34 @@ describe("get_run", () => {
 });
 
 describe("approve", () => {
-  it("advances CP1 -> CP2 -> CP3 and closes the run as succeeded", async () => {
+  it("rejects a checkpoint before the orchestrator is waiting on it", async () => {
     const runId = await newRunId();
+    const res = await callTool("approve", { runId, checkpoint: "CP1" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent.error).toBe("not_ready");
+    const run = await store.getRun(runId);
+    expect(run?.status).toBe("active");
+    expect(run?.phase).toBe("queued");
+    expect(run?.approvals).toEqual([]);
+  });
+
+  it("advances CP1 -> CP2 -> CP3 only at the matching phase and then succeeds", async () => {
+    const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
 
     const cp1 = await approveTool({ runId, checkpoint: "CP1", comment: "plan ok" }, ctx);
     expect(cp1.stage).toBe("awaiting_cp2");
     expect(cp1.status).toBe("active");
 
+    const earlyCp2 = await callTool("approve", { runId, checkpoint: "CP2" }, ctx);
+    expect(earlyCp2.structuredContent.error).toBe("not_ready");
+
+    store.setPhase(runId, "awaiting_cp2");
     const cp2 = await approveTool({ runId, checkpoint: "CP2" }, ctx);
     expect(cp2.stage).toBe("awaiting_cp3");
+    expect(cp2.status).toBe("active");
 
+    store.setPhase(runId, "awaiting_cp3");
     const cp3 = await approveTool({ runId, checkpoint: "CP3" }, ctx);
     expect(cp3.stage).toBe("approved");
     expect(cp3.status).toBe("succeeded");
@@ -104,6 +125,7 @@ describe("approve", () => {
 
   it("rejects a duplicate approval", async () => {
     const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
     await approveTool({ runId, checkpoint: "CP1" }, ctx);
     const res = await callTool("approve", { runId, checkpoint: "CP1" }, ctx);
     expect(res.structuredContent.error).toBe("already_approved");

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { RunPhase } from "@gb/shared";
 import type { ApproveInput, CreateRunInput, RunRecord, RunStore } from "./types.js";
 import { RunStoreError } from "./types.js";
 import { assertCanApprove, stageFor, statusAfterApproval } from "./workflow.js";
@@ -16,6 +17,7 @@ export class InMemoryRunStore implements RunStore {
       requestId: randomUUID(),
       request: input.request,
       status: "active",
+      phase: "queued",
       iteration: 0,
       version: 1,
       startedAt: new Date().toISOString(),
@@ -37,7 +39,12 @@ export class InMemoryRunStore implements RunStore {
       throw new RunStoreError("not_found", `run ${input.runId} not found`);
     }
     assertCanApprove(
-      { runId: run.runId, status: run.status, approved: run.approvals.map((a) => a.checkpoint) },
+      {
+        runId: run.runId,
+        status: run.status,
+        phase: run.phase,
+        approved: run.approvals.map((a) => a.checkpoint),
+      },
       input.checkpoint,
     );
     const at = new Date().toISOString();
@@ -52,6 +59,16 @@ export class InMemoryRunStore implements RunStore {
     if (run.status !== "active") run.endedAt = at;
     run.version += 1;
     return view(run);
+  }
+
+  /**
+   * Test fixture for the phase the orchestrator would have saved.
+   * Does not bump version and is not an MCP operation.
+   */
+  setPhase(runId: string, phase: RunPhase): void {
+    const run = this.runs.get(runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    run.phase = phase;
   }
 }
 

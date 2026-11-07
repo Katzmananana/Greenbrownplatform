@@ -1,4 +1,5 @@
-import type { Checkpoint, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
+import type { AgentJobName, Checkpoint, OrgConfig, RunPhase, RunStatus } from "@gb/shared";
+import { phaseAcceptsCheckpoint } from "@gb/shared";
 import type { CreditLedgerStore } from "@gb/credits";
 import { InMemoryCreditLedger, defaultLabOrgConfig } from "@gb/credits";
 import { isDue } from "./due.js";
@@ -12,7 +13,22 @@ export interface RunRepository {
   release(id: string, version: number): Promise<void>;
   loadConfig(): Promise<OrgConfig>;
   loadLedger(orgId: string, runId: string): Promise<CreditLedgerStore>;
+  /**
+   * Record the estimated cost of a new agent dispatch once. Re-enqueue of the
+   * same role+iteration must not call this again.
+   */
+  recordDispatch(input: DispatchSpend): Promise<void>;
   close(): Promise<void>;
+}
+
+export interface DispatchSpend {
+  orgId: string;
+  runId: string;
+  requestId: string;
+  role: "planner" | "coder" | "fixer";
+  jobName: AgentJobName;
+  iteration: number;
+  costUsd: number;
 }
 
 interface MemoryRow {
@@ -32,8 +48,9 @@ interface MemoryRow {
 
 /**
  * In-process store used by tests and as the spec for the SQL claim predicate
- * (`isDue`). `recordGatewayApproval` mirrors gateway `approve`: checkpoints
- * stay in order, and CP3 sets status to succeeded without touching phase.
+ * (`isDue`). `recordGatewayApproval` mirrors gateway `approve`: a checkpoint
+ * is accepted only in its waiting phase, and only CP3 at `awaiting_cp3`
+ * sets status to succeeded.
  */
 export class MemoryRunRepository implements RunRepository {
   config: OrgConfig = defaultLabOrgConfig();
@@ -69,9 +86,8 @@ export class MemoryRunRepository implements RunRepository {
   }
 
   /**
-   * Same end state as gateway `statusAfterApproval`: only CP3 leaves `active`.
-   * Phase is left untouched so the orchestrator cannot lose the approval race
-   * by rewriting a checkpoint the human just recorded.
+   * Mirrors gateway `assertCanApprove`: wrong phase is `not_ready` and does
+   * not record the approval or change status. CP3 at `awaiting_cp3` succeeds.
    */
   recordGatewayApproval(id: string, checkpoint: Checkpoint): void {
     const row = this.rows.get(id);
@@ -86,6 +102,11 @@ export class MemoryRunRepository implements RunRepository {
     const expected = order.find((cp) => !row.approved.includes(cp));
     if (expected !== checkpoint) {
       throw new Error(`cannot approve ${checkpoint}; next checkpoint is ${expected ?? "none"}`);
+    }
+    if (!phaseAcceptsCheckpoint(row.phase, checkpoint)) {
+      throw new Error(
+        `not_ready: cannot approve ${checkpoint}; orchestrator phase is ${row.phase}`,
+      );
     }
     row.approved.push(checkpoint);
     row.version += 1;
@@ -126,7 +147,41 @@ export class MemoryRunRepository implements RunRepository {
   }
 
   async loadLedger(_orgId: string, runId: string): Promise<CreditLedgerStore> {
-    return this.ledgers.get(runId) ?? new InMemoryCreditLedger();
+    return this.ledgerFor(runId);
+  }
+
+  async recordDispatch(input: DispatchSpend): Promise<void> {
+    if (!(input.costUsd > 0)) return;
+    const ledger = this.ledgerFor(input.runId);
+    const reason = dispatchReason(input);
+    if (ledger.list().some((entry) => entry.runId === input.runId && entry.reason === reason)) {
+      return;
+    }
+    ledger.append({
+      id: reason,
+      orgId: input.orgId,
+      requestId: input.requestId,
+      runId: input.runId,
+      role: input.role,
+      provider: "none",
+      model: "stub",
+      inTokens: 0,
+      outTokens: 0,
+      costUsd: input.costUsd,
+      reason,
+      createdAt: new Date(0).toISOString(),
+    });
+  }
+
+  private ledgerFor(runId: string): InMemoryCreditLedger {
+    const existing = this.ledgers.get(runId);
+    if (existing instanceof InMemoryCreditLedger) return existing;
+    const created = new InMemoryCreditLedger();
+    if (existing) {
+      for (const entry of existing.list()) created.append(entry);
+    }
+    this.ledgers.set(runId, created);
+    return created;
   }
 
   async close(): Promise<void> {}
@@ -146,4 +201,8 @@ export class MemoryRunRepository implements RunRepository {
       approved: [...row.approved],
     };
   }
+}
+
+export function dispatchReason(input: DispatchSpend): string {
+  return `orchestrator_dispatch:${input.jobName}:${input.iteration}`;
 }

@@ -1,6 +1,7 @@
 import type { Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp, type GatewayOptions } from "../src/app.js";
+import { InMemoryRunStore } from "../src/store/memory.js";
 
 const TOKEN = "lab-test-token";
 
@@ -67,8 +68,9 @@ describe("MCP over HTTP", () => {
     expect(res.status).toBe(200);
   });
 
-  it("initialize, tools/list, then create_run -> approve CP1..CP3 -> get_run", async () => {
-    const url = await start();
+  it("initialize, tools/list, then create_run -> approve only when the phase is ready", async () => {
+    const store = new InMemoryRunStore();
+    const url = await start({ runStore: store });
 
     const init = await rpc(url, "initialize", {
       protocolVersion: "2025-06-18",
@@ -87,9 +89,18 @@ describe("MCP over HTTP", () => {
 
     const created = await tool(url, "create_run", { request: "add a /status page" });
     expect(created.status).toBe("active");
+    expect(created.phase).toBe("queued");
     const { runId } = created;
 
-    for (const checkpoint of ["CP1", "CP2", "CP3"]) {
+    const tooSoon = await tool(url, "approve", { runId, checkpoint: "CP1" });
+    expect(tooSoon.error).toBe("not_ready");
+
+    for (const [phase, checkpoint] of [
+      ["awaiting_cp1", "CP1"],
+      ["awaiting_cp2", "CP2"],
+      ["awaiting_cp3", "CP3"],
+    ] as const) {
+      store.setPhase(runId, phase);
       const approved = await tool(url, "approve", { runId, checkpoint });
       expect(approved.checkpoint).toBe(checkpoint);
     }

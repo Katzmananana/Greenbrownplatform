@@ -57,6 +57,17 @@ export async function runTick(deps: TickDeps): Promise<TickStats> {
         }
         saved = true;
         stats.saved += 1;
+        if (outcome.enqueue && deps.estimateUsd > 0) {
+          await deps.repo.recordDispatch({
+            orgId: config.orgId,
+            runId: run.id,
+            requestId: run.requestId,
+            role: outcome.enqueue.role,
+            jobName: outcome.enqueue.name,
+            iteration: outcome.enqueue.iteration,
+            costUsd: deps.estimateUsd,
+          });
+        }
       }
       if (outcome.enqueue) {
         await deps.jobs.enqueue(outcome.enqueue);

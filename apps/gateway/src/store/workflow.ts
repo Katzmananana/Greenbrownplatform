@@ -1,4 +1,10 @@
-import type { Checkpoint, RunStatus } from "@gb/shared";
+import {
+  PHASE_FOR_CHECKPOINT,
+  phaseAcceptsCheckpoint,
+  type Checkpoint,
+  type RunPhase,
+  type RunStatus,
+} from "@gb/shared";
 import { type RunStage, RunStoreError } from "./types.js";
 
 export const CHECKPOINT_ORDER: readonly Checkpoint[] = ["CP1", "CP2", "CP3"];
@@ -29,7 +35,12 @@ export function stageFor(approved: Iterable<Checkpoint>): RunStage {
  * and only while the run is still active.
  */
 export function assertCanApprove(
-  run: { runId: string; status: RunStatus; approved: Iterable<Checkpoint> },
+  run: {
+    runId: string;
+    status: RunStatus;
+    phase: RunPhase;
+    approved: Iterable<Checkpoint>;
+  },
   checkpoint: Checkpoint,
 ): void {
   const approved = new Set(run.approved);
@@ -50,6 +61,13 @@ export function assertCanApprove(
     throw new RunStoreError(
       "out_of_order",
       `cannot approve ${checkpoint} for run ${run.runId}; next checkpoint is ${expected ?? "none"}`,
+    );
+  }
+  if (!phaseAcceptsCheckpoint(run.phase, checkpoint)) {
+    const required = PHASE_FOR_CHECKPOINT[checkpoint];
+    throw new RunStoreError(
+      "not_ready",
+      `cannot approve ${checkpoint} for run ${run.runId}; orchestrator phase is ${run.phase}, required ${required}`,
     );
   }
 }

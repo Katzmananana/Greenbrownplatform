@@ -57,7 +57,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "approve",
     title: "Approve checkpoint",
     description:
-      "Record a human approval for the run's next checkpoint (CP1, then CP2, then CP3). Approving CP3 marks the run succeeded.",
+      "Record a human approval only when the orchestrator is waiting on that checkpoint: CP1 at phase awaiting_cp1 (after planning), CP2 at awaiting_cp2 (after gates pass), CP3 at awaiting_cp3. Approving CP3 then marks the run succeeded. Earlier approval is rejected.",
     inputSchema: {
       type: "object",
       properties: {
@@ -106,7 +106,13 @@ export const createRunTool: ToolHandler = async (args, ctx) => {
     throw new ToolInputError(`request must be at most ${MAX_REQUEST_CHARS} characters`);
   }
   const run = await ctx.store.createRun({ request });
-  return { runId: run.runId, status: run.status, stage: run.stage, requestId: run.requestId };
+  return {
+    runId: run.runId,
+    status: run.status,
+    stage: run.stage,
+    phase: run.phase,
+    requestId: run.requestId,
+  };
 };
 
 export const getRunTool: ToolHandler = async (args, ctx) => {

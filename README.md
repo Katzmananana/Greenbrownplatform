@@ -47,11 +47,13 @@ Tools:
 
 | Tool | Input | Result |
 |---|---|---|
-| `create_run` | `{ request: string }` | `{ runId, status, stage, requestId }` — new run, `status: "active"`, `stage: "awaiting_cp1"` |
-| `get_run` | `{ runId: string }` | full run: `status`, `stage`, `request`, `approvals[]`, `version`, timestamps |
-| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` | records the approval and advances `stage`; checkpoints must go in order, once each; CP3 sets `status: "succeeded"` |
+| `create_run` | `{ request: string }` | `{ runId, status, stage, phase, requestId }` — new run, `status: "active"`, `phase: "queued"`, `stage: "awaiting_cp1"` |
+| `get_run` | `{ runId: string }` | full run: `status`, `phase`, `stage`, `request`, `approvals[]`, `version`, timestamps |
+| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` | records the approval only when `phase` is `awaiting_cp1` / `awaiting_cp2` / `awaiting_cp3` for that checkpoint, in order, once each. CP3 at `awaiting_cp3` sets `status: "succeeded"` |
 
-Tool failures (bad arguments, unknown run, out-of-order approval) come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved` or `run_not_active`.
+`stage` is still the next human checkpoint derived from approvals. `phase` is the orchestrator lifecycle. A fresh run reports `stage: "awaiting_cp1"` and `phase: "queued"`; CP1 is rejected with `not_ready` until planning finishes and `phase` is `awaiting_cp1`. CP2 waits until gates have passed. CP3 cannot close the run before that.
+
+Tool failures come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved`, `run_not_active`, or `not_ready`.
 
 **Auth** — every `/mcp` call needs `Authorization: Bearer <token>`:
 
@@ -79,19 +81,22 @@ Claude Code: `claude mcp add --transport http gb-gateway http://127.0.0.1:3000/m
 
 ## Orchestrator lifecycle
 
-`apps/orchestrator` polls Postgres for runs the gateway created and advances `runs.phase` (migration `db/migrations/003_run_phase.sql`). MCP `stage` is unchanged: it is still derived only from approvals. The loop never writes `approvals` and only saves a transition when `status` is still `active` and `version` matches, so a concurrent `approve` — including CP3 → `succeeded` — wins.
+`apps/orchestrator` polls Postgres for runs the gateway created and advances `runs.phase` (migration `db/migrations/003_run_phase.sql`). MCP `stage` stays the next human checkpoint. The loop never writes `approvals`. It saves a transition only when `status` is still `active` and `version` matches.
 
 | Phase | What happens |
 |---|---|
-| `queued` | Credit check, then enqueue a `plan` job |
-| `planning` | Wait until the worker acks. Then `awaiting_cp1`, or `coding` if CP1 is already approved |
+| `queued` | Credit check, then enqueue a `plan` job. CP1 is rejected here |
+| `planning` | Wait until the worker acks, then `awaiting_cp1` |
 | `awaiting_cp1` | Park until gateway records CP1. No code job before that |
 | `coding` | Wait for the `code` job, then run gates |
-| `gates` | Logic-only §7 results (no CI calls). Failure uses `decideFixLoop`: retry enqueues `fix`, cap sets `status=escalated` |
+| `gates` | Logic-only §7 results (no CI calls). Failure uses `decideFixLoop`: retry enqueues `fix`, cap sets `status=escalated`. A green result does not set `succeeded` |
 | `fixing` | Wait for the fixer job, then gates again |
-| `awaiting_cp2` / `awaiting_cp3` | Park until that approval. CP3 is still closed by gateway `approve` |
+| `awaiting_cp2` | Park until CP2. CP3 is still rejected |
+| `awaiting_cp3` | Park until CP3. That approval is what sets `status=succeeded` |
 
-Over-budget work sets `status=needs_human` and does not enqueue. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+Approvals already present do not skip planning, coding, or gates, and they do not close the run before `awaiting_cp3`. When `GB_AGENT_ESTIMATE_USD` is greater than 0, each new dispatch appends that estimate to `credit_ledger` once (same role and iteration is not charged again if the job is re-enqueued). Over budget sets `status=needs_human` and does not enqueue. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+
+Gate results inside the run are placeholders. GitHub CI on this repo is also not a substitute for those run gates: `reviewer` passes only because `GATE_STUB=1`, `acceptance` matches a fixture, `sast` is a regex plus `pnpm audit`, `load` hammers gateway `/health` for two seconds, and `load-staging` / `e2e` are lab stubs. None of them execute the change request.
 
 Worker (`apps/worker`) consumes BullMQ queue `jobs`. Handlers accept the payload (`v`, `name`, `runId`, `requestId`, `iteration`, `role`, `requestText`) and ack a stub result. They do not call a model.
 

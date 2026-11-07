@@ -19,6 +19,11 @@ export type {
   RunStatus,
 } from "./types.js";
 export { RUN_PHASES } from "./types.js";
+export {
+  PHASE_FOR_CHECKPOINT,
+  isRunPhase,
+  phaseAcceptsCheckpoint,
+} from "./checkpoints.js";
 export { JOB_QUEUE_NAME, agentJobId, parseAgentJobPayload } from "./jobs.js";
 export type { AgentJobName, AgentJobPayload } from "./jobs.js";
 export { bullmqConnectionFromUrl } from "./redis.js";

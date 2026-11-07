@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Checkpoint, RunStatus } from "@gb/shared";
+import { isRunPhase, type Checkpoint, type RunPhase, type RunStatus } from "@gb/shared";
 import type { ApprovalRecord, ApproveInput, CreateRunInput, RunRecord, RunStore } from "./types.js";
 import { RunStoreError } from "./types.js";
 import { assertCanApprove, stageFor, statusAfterApproval } from "./workflow.js";
@@ -20,12 +20,15 @@ export interface PgPoolLike extends PgQueryable {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const RUN_SELECT = `
-  SELECT r.id, r.request_id, r.status, r.iteration, r.version, r.started_at, r.ended_at,
+function runSelect(withPhase: boolean): string {
+  const phase = withPhase ? "r.phase," : "";
+  return `
+  SELECT r.id, r.request_id, r.status, ${phase} r.iteration, r.version, r.started_at, r.ended_at,
          q.text AS request
   FROM runs r
   LEFT JOIN requests q ON q.id = r.request_id
   WHERE r.id = $1`;
+}
 
 const APPROVALS_SELECT = `
   SELECT checkpoint, decision, user_id, comment, at
@@ -40,9 +43,33 @@ const APPROVALS_SELECT = `
 export class PostgresRunStore implements RunStore {
   readonly kind = "postgres" as const;
   private readonly pool: PgPoolLike;
+  /** Null until looked up. False when migration 003 has not been applied. */
+  private phaseColumn: boolean | null = null;
 
   constructor(pool: PgPoolLike) {
     this.pool = pool;
+  }
+
+  private async hasPhaseColumn(): Promise<boolean> {
+    if (this.phaseColumn !== null) return this.phaseColumn;
+    const { rows } = await this.pool.query(
+      `SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'runs' AND column_name = 'phase'`,
+    );
+    this.phaseColumn = rows.length > 0;
+    return this.phaseColumn;
+  }
+
+  private async selectRun(
+    db: PgQueryable,
+    runId: string,
+    forUpdate: boolean,
+  ): Promise<any | undefined> {
+    const withPhase = await this.hasPhaseColumn();
+    const lock = forUpdate ? " FOR UPDATE OF r" : "";
+    const { rows } = await db.query(`${runSelect(withPhase)}${lock}`, [runId]);
+    return rows[0];
   }
 
   async createRun(input: CreateRunInput): Promise<RunRecord> {
@@ -62,8 +89,7 @@ export class PostgresRunStore implements RunStore {
 
   async getRun(runId: string): Promise<RunRecord | null> {
     if (!UUID_RE.test(runId)) return null;
-    const { rows } = await this.pool.query(RUN_SELECT, [runId]);
-    const row = rows[0];
+    const row = await this.selectRun(this.pool, runId, false);
     if (!row) return null;
     const approvals = await this.pool.query(APPROVALS_SELECT, [row.request_id]);
     return toRecord(row, approvals.rows);
@@ -76,8 +102,7 @@ export class PostgresRunStore implements RunStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const { rows } = await client.query(`${RUN_SELECT} FOR UPDATE OF r`, [input.runId]);
-      const row = rows[0];
+      const row = await this.selectRun(client, input.runId, true);
       if (!row) {
         throw new RunStoreError("not_found", `run ${input.runId} not found`);
       }
@@ -86,6 +111,7 @@ export class PostgresRunStore implements RunStore {
         {
           runId: input.runId,
           status: row.status as RunStatus,
+          phase: phaseOf(row.phase),
           approved: existing.rows.map((a) => a.checkpoint as Checkpoint),
         },
         input.checkpoint,
@@ -133,6 +159,10 @@ export class PostgresRunStore implements RunStore {
   }
 }
 
+function phaseOf(value: unknown): RunPhase {
+  return isRunPhase(value) ? value : "queued";
+}
+
 function toIso(value: unknown): string | null {
   if (value == null) return null;
   if (value instanceof Date) return value.toISOString();
@@ -152,6 +182,7 @@ function toRecord(row: any, approvalRows: any[]): RunRecord {
     requestId: String(row.request_id),
     request: row.request ?? null,
     status: row.status as RunStatus,
+    phase: phaseOf(row.phase),
     stage: stageFor(approvals.map((a) => a.checkpoint)),
     iteration: Number(row.iteration),
     version: Number(row.version),
