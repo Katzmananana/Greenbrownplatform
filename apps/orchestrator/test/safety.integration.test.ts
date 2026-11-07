@@ -10,6 +10,7 @@ import { completeDispatchOnce, finishDispatch } from "../../worker/src/complete.
 import { createBullDispatcher } from "../src/bull.js";
 import { runTick } from "../src/loop.js";
 import { createPostgresRepository } from "../src/postgres.js";
+import type { RunSnapshot } from "../src/types.js";
 
 const databaseUrl = process.env.GB_TEST_DATABASE_URL;
 const redisUrl = process.env.GB_TEST_REDIS_URL;
@@ -113,6 +114,83 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
       [runId],
     );
     return Number(rows[0]?.n ?? 0);
+  }
+
+  async function loadSnap(runId: string): Promise<RunSnapshot> {
+    const { rows } = await pool.query(
+      `SELECT id, request_id, status, phase, phase_reason, iteration, version, started_at, deadline_at, execution_mode
+       FROM runs WHERE id = $1`,
+      [runId],
+    );
+    const row = rows[0];
+    if (!row) throw new Error(`run ${runId} missing`);
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      requestText: null,
+      status: row.status,
+      phase: row.phase,
+      phaseReason: row.phase_reason == null ? null : String(row.phase_reason),
+      iteration: Number(row.iteration ?? 0),
+      version: Number(row.version ?? 0),
+      startedAt: new Date(row.started_at).toISOString(),
+      deadlineAt: row.deadline_at ? new Date(row.deadline_at).toISOString() : null,
+      approved: [],
+      executionMode: row.execution_mode === "live" ? "live" : "simulation",
+      evidenceReady: false,
+    };
+  }
+
+  async function outbox(idempotencyKey: string): Promise<{
+    state: string;
+    reconciliation: string | null;
+    executions: number;
+  }> {
+    const { rows } = await pool.query(
+      `SELECT state, reconciliation, executions FROM dispatch_outbox WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    const row = rows[0];
+    if (!row) throw new Error(`outbox ${idempotencyKey} missing`);
+    return {
+      state: String(row.state),
+      reconciliation: row.reconciliation == null ? null : String(row.reconciliation),
+      executions: Number(row.executions ?? 0),
+    };
+  }
+
+  async function seedRunning(label: string): Promise<{
+    run: { runId: string; requestId: string };
+    key: string;
+    payload: {
+      v: 1;
+      name: "plan";
+      role: "planner";
+      runId: string;
+      requestId: string;
+      iteration: 0;
+      requestText: null;
+    };
+  }> {
+    const run = await store.createRun({ request: label });
+    await pool.query(`UPDATE runs SET phase = 'planning' WHERE id = $1`, [run.runId]);
+    const payload = {
+      v: 1 as const,
+      name: "plan" as const,
+      role: "planner" as const,
+      runId: run.runId,
+      requestId: run.requestId,
+      iteration: 0 as const,
+      requestText: null,
+    };
+    const key = agentJobId(payload);
+    await pool.query(
+      `INSERT INTO dispatch_outbox
+         (idempotency_key, org_id, run_id, request_id, job_name, role, iteration, payload, cost_usd, state, executions, heartbeat_at)
+       VALUES ($1, $2::uuid, $3, $4, 'plan', 'planner', 0, $5::jsonb, 1, 'running', 1, now())`,
+      [key, ORG, run.runId, run.requestId, JSON.stringify(payload)],
+    );
+    return { run, key, payload };
   }
 
   async function waitUntil(predicate: () => Promise<boolean>): Promise<void> {
@@ -653,5 +731,275 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
       state: "needs_reconciliation",
       reconciliation: "external_effect_unknown",
     });
+  });
+
+  it("keeps needs_reconciliation when the handler starts, the deadline passes, halt runs, then finish runs", async () => {
+    await reset();
+    await worker.pause();
+    try {
+      const run = await store.createRun({ request: "halt after handler" });
+      const [snap] = await repo.claimDue(1, 5, new Date());
+      if (!snap) throw new Error("expected a claimed run");
+      const org = await repo.loadConfig();
+      const payload = {
+        v: 1 as const,
+        name: "plan" as const,
+        role: "planner" as const,
+        runId: snap.id,
+        requestId: snap.requestId,
+        iteration: 0,
+        requestText: null,
+      };
+      const committed = await repo.commitDispatch(
+        snap,
+        {
+          status: "active",
+          phase: "planning",
+          phaseReason: null,
+          iteration: 0,
+          deadlineAt: snap.deadlineAt,
+        },
+        {
+          orgId: org.orgId,
+          runId: snap.id,
+          requestId: snap.requestId,
+          role: "planner",
+          jobName: "plan",
+          iteration: 0,
+          costUsd: 1,
+          payload,
+        },
+      );
+      if (committed.status !== "pending")
+        throw new Error(`expected pending, got ${committed.status}`);
+      await jobs.enqueue(payload);
+      await repo.markEnqueued(committed.idempotencyKey);
+
+      const done = await completeDispatchOnce(pool, "plan", payload, {
+        afterHandler: async () => {
+          await pool.query(
+            `UPDATE runs SET deadline_at = now() - interval '1 second' WHERE id = $1`,
+            [run.runId],
+          );
+          const fresh = await loadSnap(run.runId);
+          const halted = await repo.haltRun(fresh, {
+            status: "needs_human",
+            phase: "planning",
+            phaseReason: "wall_clock",
+            iteration: fresh.iteration,
+            deadlineAt: fresh.deadlineAt,
+          });
+          expect(halted).toBe("ok");
+        },
+      });
+      expect(done).toMatchObject({
+        executed: true,
+        reason: "needs_reconciliation",
+        result: { externalEffect: "unknown" },
+      });
+      const box = await outbox(committed.idempotencyKey);
+      expect(box).toMatchObject({
+        state: "needs_reconciliation",
+        reconciliation: "halted_while_running",
+        executions: 1,
+      });
+      const stored = await pool.query(`SELECT status, phase_reason FROM runs WHERE id = $1`, [
+        run.runId,
+      ]);
+      expect(stored.rows[0]).toMatchObject({ status: "needs_human", phase_reason: "wall_clock" });
+
+      expect(await finishDispatch(pool, committed.idempotencyKey)).toBe("needs_reconciliation");
+      expect(await repo.markDispatchCompleted(committed.idempotencyKey)).toEqual({
+        executed: false,
+      });
+      await pool.query(
+        `UPDATE dispatch_outbox SET heartbeat_at = now() - interval '2 hours' WHERE idempotency_key = $1`,
+        [committed.idempotencyKey],
+      );
+      expect(
+        await repo.reconcileStaleRunning(committed.idempotencyKey, await loadSnap(run.runId), 30),
+      ).toBe(false);
+      expect(await outbox(committed.idempotencyKey)).toMatchObject({
+        state: "needs_reconciliation",
+        reconciliation: "halted_while_running",
+        executions: 1,
+      });
+      expect(await completeDispatchOnce(pool, "plan", payload)).toMatchObject({
+        executed: false,
+        reason: "not_runnable",
+      });
+      expect((await tick(1)).enqueued).toBe(0);
+      expect(await executions(run.runId)).toBe(1);
+    } finally {
+      const queued = await queue.getJobs(["waiting", "active", "delayed", "paused"]);
+      await Promise.all(queued.map((job) => job.remove().catch(() => undefined)));
+      await worker.resume();
+    }
+  });
+
+  it("does not let a later halt replace a cause finish already stored", async () => {
+    await reset();
+    const seeded = await seedRunning("finish then halt");
+    await pool.query(`UPDATE runs SET deadline_at = now() - interval '1 second' WHERE id = $1`, [
+      seeded.run.runId,
+    ]);
+    expect(await finishDispatch(pool, seeded.key)).toBe("needs_reconciliation");
+    const halted = await repo.haltRun(await loadSnap(seeded.run.runId), {
+      status: "needs_human",
+      phase: "planning",
+      phaseReason: "wall_clock",
+      iteration: 0,
+      deadlineAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    expect(halted).toBe("conflict");
+    expect(await outbox(seeded.key)).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "external_effect_unknown",
+      executions: 1,
+    });
+    await pool.query(`UPDATE runs SET status = 'active', phase_reason = NULL WHERE id = $1`, [
+      seeded.run.runId,
+    ]);
+    const fresh = await loadSnap(seeded.run.runId);
+    expect(
+      await repo.haltRun(fresh, {
+        status: "needs_human",
+        phase: "planning",
+        phaseReason: "wall_clock",
+        iteration: fresh.iteration,
+        deadlineAt: fresh.deadlineAt,
+      }),
+    ).toBe("ok");
+    expect(await outbox(seeded.key)).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "external_effect_unknown",
+      executions: 1,
+    });
+    expect(await completeDispatchOnce(pool, "plan", seeded.payload)).toMatchObject({
+      executed: false,
+      reason: "not_runnable",
+    });
+  });
+
+  it("covers concurrent halt and finish without completing or rerunning", async () => {
+    await reset();
+    for (let i = 0; i < 4; i += 1) {
+      const seeded = await seedRunning(`race ${i}`);
+      await pool.query(`UPDATE runs SET deadline_at = now() - interval '1 second' WHERE id = $1`, [
+        seeded.run.runId,
+      ]);
+      const fresh = await loadSnap(seeded.run.runId);
+      const [halted, finished] = await Promise.all([
+        repo.haltRun(fresh, {
+          status: "needs_human",
+          phase: "planning",
+          phaseReason: "wall_clock",
+          iteration: fresh.iteration,
+          deadlineAt: fresh.deadlineAt,
+        }),
+        finishDispatch(pool, seeded.key),
+      ]);
+      expect(["ok", "conflict"]).toContain(halted);
+      expect(finished).toBe("needs_reconciliation");
+      const box = await outbox(seeded.key);
+      expect(box.state).toBe("needs_reconciliation");
+      expect(["halted_while_running", "external_effect_unknown"]).toContain(box.reconciliation);
+      expect(box.executions).toBe(1);
+      expect(await finishDispatch(pool, seeded.key)).toBe("needs_reconciliation");
+      expect(await repo.markDispatchCompleted(seeded.key)).toEqual({ executed: false });
+      expect(
+        await repo.reconcileStaleRunning(seeded.key, await loadSnap(seeded.run.runId), 0),
+      ).toBe(false);
+      expect(await outbox(seeded.key)).toMatchObject({
+        state: "needs_reconciliation",
+        reconciliation: box.reconciliation,
+        executions: 1,
+      });
+      expect(await completeDispatchOnce(pool, "plan", seeded.payload)).toMatchObject({
+        executed: false,
+        reason: "not_runnable",
+      });
+    }
+  });
+
+  it("reconciles a cancelled in-flight dispatch and still cancels one that never started", async () => {
+    await reset();
+    const seeded = await seedRunning("cancel in flight");
+    const fresh = await loadSnap(seeded.run.runId);
+    expect(
+      await repo.haltRun(fresh, {
+        status: "cancelled",
+        phase: "planning",
+        phaseReason: "cancelled",
+        iteration: fresh.iteration,
+        deadlineAt: fresh.deadlineAt,
+      }),
+    ).toBe("ok");
+    expect(await finishDispatch(pool, seeded.key)).toBe("needs_reconciliation");
+    expect(await outbox(seeded.key)).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "halted_while_running",
+      executions: 1,
+    });
+    const runRow = await pool.query(`SELECT status, phase_reason FROM runs WHERE id = $1`, [
+      seeded.run.runId,
+    ]);
+    expect(runRow.rows[0]).toMatchObject({ status: "cancelled", phase_reason: "cancelled" });
+    await pool.query(
+      `UPDATE dispatch_outbox SET heartbeat_at = now() - interval '2 hours' WHERE idempotency_key = $1`,
+      [seeded.key],
+    );
+    expect(await repo.reconcileStaleRunning(seeded.key, await loadSnap(seeded.run.runId), 1)).toBe(
+      false,
+    );
+    expect(await repo.markDispatchCompleted(seeded.key)).toEqual({ executed: false });
+    expect((await outbox(seeded.key)).reconciliation).toBe("halted_while_running");
+    expect((await completeDispatchOnce(pool, "plan", seeded.payload)).executed).toBe(false);
+
+    const legacy = await seedRunning("legacy cancelled while running");
+    await pool.query(`UPDATE dispatch_outbox SET state = 'cancelled' WHERE idempotency_key = $1`, [
+      legacy.key,
+    ]);
+    await pool.query(
+      `UPDATE runs SET status = 'needs_human', phase_reason = 'wall_clock' WHERE id = $1`,
+      [legacy.run.runId],
+    );
+    expect(await finishDispatch(pool, legacy.key)).toBe("needs_reconciliation");
+    expect(await outbox(legacy.key)).toMatchObject({
+      state: "needs_reconciliation",
+      reconciliation: "external_effect_unknown",
+      executions: 1,
+    });
+
+    const waiting = await store.createRun({ request: "not started" });
+    await pool.query(`UPDATE runs SET phase = 'planning' WHERE id = $1`, [waiting.runId]);
+    const pendingKey = agentJobId({ name: "plan", runId: waiting.runId, iteration: 0 });
+    await pool.query(
+      `INSERT INTO dispatch_outbox
+         (idempotency_key, org_id, run_id, request_id, job_name, role, iteration, payload, cost_usd, state, executions)
+       VALUES ($1, $2::uuid, $3, $4, 'plan', 'planner', 0, '{}'::jsonb, 1, 'pending', 0)`,
+      [pendingKey, ORG, waiting.runId, waiting.requestId],
+    );
+    const pendingSnap = await loadSnap(waiting.runId);
+    expect(
+      await repo.haltRun(pendingSnap, {
+        status: "needs_human",
+        phase: "planning",
+        phaseReason: "wall_clock",
+        iteration: pendingSnap.iteration,
+        deadlineAt: pendingSnap.deadlineAt,
+      }),
+    ).toBe("ok");
+    expect(await finishDispatch(pool, pendingKey)).not.toBe("completed");
+    const pending = await pool.query(
+      `SELECT state, executions, reconciliation FROM dispatch_outbox WHERE idempotency_key = $1`,
+      [pendingKey],
+    );
+    expect(pending.rows[0]).toMatchObject({
+      state: "cancelled",
+      executions: 0,
+      reconciliation: null,
+    });
+    expect(await executions(waiting.runId)).toBe(0);
   });
 });

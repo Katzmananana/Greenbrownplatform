@@ -400,9 +400,11 @@ export class PostgresRunRepository implements RunRepository {
       await client.query("BEGIN");
       const { rows } = await client.query(
         `UPDATE dispatch_outbox
-         SET state = 'needs_reconciliation', reconciliation = 'crash_after_running'
+         SET state = 'needs_reconciliation',
+             reconciliation = COALESCE(NULLIF(reconciliation, ''), 'crash_after_running')
          WHERE idempotency_key = $1
            AND state = 'running'
+           AND (reconciliation IS NULL OR reconciliation = '')
            AND (heartbeat_at IS NULL OR heartbeat_at < now() - ($2::int * interval '1 second'))
          RETURNING run_id`,
         [idempotencyKey, staleSeconds],
@@ -433,7 +435,9 @@ export class PostgresRunRepository implements RunRepository {
     const { rows } = await this.pool.query(
       `UPDATE dispatch_outbox
        SET state = 'completed', completed_at = now()
-       WHERE idempotency_key = $1 AND state = 'running'
+       WHERE idempotency_key = $1
+         AND state = 'running'
+         AND (reconciliation IS NULL OR reconciliation = '')
        RETURNING executions`,
       [idempotencyKey],
     );
@@ -498,12 +502,20 @@ async function writeHalt(
      RETURNING id`,
     [prev.id, prev.version, patch.status, patch.phase, reason, patch.iteration, patch.deadlineAt],
   );
+  if (rows.length === 0) return false;
   await client.query(
     `UPDATE dispatch_outbox SET state = 'cancelled'
-     WHERE run_id = $1::uuid AND state IN ('pending', 'enqueued', 'running')`,
+     WHERE run_id = $1::uuid AND state IN ('pending', 'enqueued')`,
     [prev.id],
   );
-  return rows.length > 0;
+  await client.query(
+    `UPDATE dispatch_outbox
+     SET state = 'needs_reconciliation',
+         reconciliation = COALESCE(NULLIF(reconciliation, ''), 'halted_while_running')
+     WHERE run_id = $1::uuid AND state = 'running'`,
+    [prev.id],
+  );
+  return true;
 }
 
 async function lockedSums(

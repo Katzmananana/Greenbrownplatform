@@ -52,7 +52,7 @@ ALTER TABLE dispatch_outbox ADD CONSTRAINT dispatch_outbox_state_check
   ));
 
 COMMENT ON COLUMN dispatch_outbox.reconciliation IS
-  'Set when a running dispatch crashes or is cancelled in flight. Does not mean an external call was stopped.';
+  'Explicit cause when a running dispatch cannot be completed: crash_after_running, halted_while_running, or external_effect_unknown. Does not mean an external call was stopped. A later writer must not replace a cause already stored.';
 
 CREATE UNIQUE INDEX IF NOT EXISTS credit_ledger_dispatch_uidx
   ON credit_ledger (run_id, reason)

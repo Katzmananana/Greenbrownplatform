@@ -43,7 +43,12 @@ export interface RunRepository {
     run: RunSnapshot,
     staleSeconds: number,
   ): Promise<boolean>;
-  /** Terminal halt plus cancel of open dispatches, so recovery cannot resume them. */
+  /**
+   * Terminal halt. Dispatches that have not started are cancelled. A running
+   * dispatch becomes needs_reconciliation with cause halted_while_running.
+   * That does not stop an external call, and it does not overwrite a cause
+   * already stored on a reconciled row.
+   */
   haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict">;
   close(): Promise<void>;
 }
@@ -295,6 +300,7 @@ export class MemoryRunRepository implements RunRepository {
           executions: 0,
           payload: spend.payload,
           heartbeatAt: null,
+          reconciliation: null,
         });
       }
       this.applyPatch(row, patch);
@@ -314,10 +320,11 @@ export class MemoryRunRepository implements RunRepository {
     staleSeconds: number,
   ): Promise<boolean> {
     const row = this.outbox.get(idempotencyKey);
-    if (!row || row.state !== "running") return false;
+    if (!row || row.state !== "running" || row.reconciliation) return false;
     const beat = row.heartbeatAt ? Date.parse(row.heartbeatAt) : 0;
     if (Date.now() - beat < staleSeconds * 1000) return false;
     row.state = "needs_reconciliation";
+    row.reconciliation = "crash_after_running";
     const stored = this.rows.get(run.id);
     if (stored && stored.status === "active") {
       this.applyHalt(stored, {
@@ -333,7 +340,13 @@ export class MemoryRunRepository implements RunRepository {
 
   async markDispatchCompleted(idempotencyKey: string): Promise<{ executed: boolean }> {
     const row = this.outbox.get(idempotencyKey);
-    if (!row || row.state === "completed" || row.state === "cancelled") {
+    if (
+      !row ||
+      row.state === "completed" ||
+      row.state === "cancelled" ||
+      row.state === "needs_reconciliation" ||
+      row.reconciliation
+    ) {
       return { executed: false };
     }
     row.state = "completed";
@@ -401,11 +414,11 @@ export class MemoryRunRepository implements RunRepository {
   private applyHalt(row: MemoryRow, patch: RunPatch): void {
     this.applyPatch(row, patch);
     for (const job of this.outbox.values()) {
-      if (
-        job.payload.runId === row.id &&
-        (job.state === "pending" || job.state === "enqueued" || job.state === "running")
-      ) {
-        job.state = "cancelled";
+      if (job.payload.runId !== row.id) continue;
+      if (job.state === "pending" || job.state === "enqueued") job.state = "cancelled";
+      else if (job.state === "running") {
+        job.state = "needs_reconciliation";
+        if (!job.reconciliation) job.reconciliation = "halted_while_running";
       }
     }
   }
@@ -421,6 +434,7 @@ interface OutboxRow {
     | "failed"
     | "needs_reconciliation";
   heartbeatAt: string | null;
+  reconciliation: string | null;
   executions: number;
   payload: AgentJobPayload;
 }
