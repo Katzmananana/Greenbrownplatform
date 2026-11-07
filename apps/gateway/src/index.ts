@@ -14,6 +14,7 @@ const server = app.listen(port, () => {
       mcp: "/mcp",
       runStore: runStore.kind,
       mcpAuth: process.env.GB_MCP_TOKEN ? "token" : "any-bearer (non-production only)",
+      humanApproval: process.env.GB_HUMAN_APPROVAL_SECRET ? "jwt" : "fail-closed",
     }),
   );
 });

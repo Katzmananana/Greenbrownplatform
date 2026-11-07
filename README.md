@@ -6,7 +6,7 @@ Autonomous **Green (ירוקה)** / **Brown (חומה)** agentic CI/CD. The plat
 - **CP2** — after the delivery package is ready
 - **CP3** — before promotion to production (same commit SHA as staging)
 
-This repository is the platform monorepo (`green-brown-platform`). It currently contains **infra + gates only**: service stubs, credit hard-stop, section-7 blocking CI, and a CP3 promote workflow. The gateway now serves a minimal MCP server (`create_run`, `get_run`, `approve`; see below). Other product features (Planner, Cursor coding agent, admin UI) are not implemented yet.
+This repository is the platform monorepo (`green-brown-platform`). It contains service skeletons, credit hard-stop, section-7 blocking CI, a CP3 promote workflow, a minimal gateway MCP server (`create_run`, `get_run`, `approve`), and the orchestrator run lifecycle (stub Planner/coder/fixer jobs). Real Planner, Cursor coding agent, and admin UI are not implemented yet.
 
 ## Lab scale
 
@@ -29,7 +29,7 @@ pnpm --filter @gb/gateway start
 # GET http://127.0.0.1:3000/health  →  200 {"status":"ok",...}
 ```
 
-Other stubs: orchestrator `:3001`, web `:3002`, worker `:3003` (override with `PORT`).
+Other services: orchestrator `:3001`, web `:3002`, worker `:3003` (override with `PORT`). The orchestrator loop stays idle until `DATABASE_URL` is set. Without `REDIS_URL` it completes agent jobs in-process; with `REDIS_URL` it enqueues them for the worker.
 
 ```bash
 pnpm lint
@@ -47,11 +47,15 @@ Tools:
 
 | Tool | Input | Result |
 |---|---|---|
-| `create_run` | `{ request: string }` | `{ runId, status, stage, requestId }` — new run, `status: "active"`, `stage: "awaiting_cp1"` |
-| `get_run` | `{ runId: string }` | full run: `status`, `stage`, `request`, `approvals[]`, `version`, timestamps |
-| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` | records the approval and advances `stage`; checkpoints must go in order, once each; CP3 sets `status: "succeeded"` |
+| `create_run` | `{ request: string }` | `{ runId, status, stage, phase, requestId }` — new run, `status: "active"`, `phase: "queued"`, `stage: "awaiting_cp1"` |
+| `get_run` | `{ runId: string }` | full run: `status`, `phase`, `stage`, `request`, `approvals[]`, `version`, timestamps |
+| `approve` | `{ runId, checkpoint: "CP1"\|"CP2"\|"CP3", comment? }` plus header `X-GB-Human-Authorization: Bearer <jwt>` | records the approval only for a fresh human JWT, and only when `phase` matches that checkpoint. CP3 sets `succeeded` only for a live run with same-commit artifact and verified gates. Simulation ends `needs_human`. |
 
-Tool failures (bad arguments, unknown run, out-of-order approval) come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved` or `run_not_active`.
+`stage` is still the next human checkpoint derived from approvals. `phase` is the orchestrator lifecycle. A fresh run reports `stage: "awaiting_cp1"` and `phase: "queued"`; CP1 is rejected with `not_ready` until planning finishes. The agent `Authorization` bearer cannot be reused as the human JWT.
+
+Human JWT (HS256), issued by the human IdP, not by this repo: claims `sub`, `auth_time` (unix seconds of reauthentication), `exp`. Sign with `GB_HUMAN_APPROVAL_SECRET`. `auth_time` older than `GB_HUMAN_AUTH_MAX_AGE_SECONDS` (default 300) is `human_auth_stale`. Unset secret is `human_auth_not_configured`. Tests use an ephemeral fixture key; do not commit a production secret. Auth.js is the intended issuer later.
+
+Tool failures come back as `result.isError: true` with `structuredContent.error` set to `invalid_arguments`, `not_found`, `out_of_order`, `already_approved`, `run_not_active`, `not_ready`, `human_auth_required`, `human_auth_invalid`, `human_auth_stale`, or `human_auth_not_configured`.
 
 **Auth** — every `/mcp` call needs `Authorization: Bearer <token>`:
 
@@ -76,6 +80,44 @@ curl -s "${H[@]}" $URL -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params
 ```
 
 Claude Code: `claude mcp add --transport http gb-gateway http://127.0.0.1:3000/mcp --header "Authorization: Bearer $TOKEN"`.
+
+## Orchestrator lifecycle
+
+`apps/orchestrator` polls Postgres for runs the gateway created and advances `runs.phase` (migration `db/migrations/003_run_phase.sql`). MCP `stage` stays the next human checkpoint. The loop never writes `approvals`. It saves a transition only when `status` is still `active` and `version` matches.
+
+| Phase | What happens |
+|---|---|
+| `queued` | Credit check, then enqueue a `plan` job. CP1 is rejected here |
+| `planning` | Wait until the worker acks, then `awaiting_cp1` |
+| `awaiting_cp1` | Park until gateway records CP1. No code job before that |
+| `coding` | Wait for the `code` job, then run gates |
+| `gates` | Logic-only §7 results (no CI calls). Failure uses `decideFixLoop`: retry enqueues `fix`, cap sets `status=escalated`. A green result does not set `succeeded` |
+| `fixing` | Wait for the fixer job, then gates again |
+| `awaiting_cp2` | Park until CP2. CP3 is still rejected |
+| `awaiting_cp3` | Park until CP3. That approval is what sets `status=succeeded` |
+
+Approvals already present do not skip planning, coding, or gates. `GB_AGENT_ESTIMATE_USD` must be greater than 0. The estimate, the `dispatch_outbox` row, and the phase change commit together under a Postgres advisory lock, so two runs cannot both pass an aggregate cap. A zero estimate is `unbudgeted_estimate` and is not enqueued. Re-enqueue of an open outbox row does not insert another charge. A `completed` outbox row is not executed again if the Redis result is deleted. Wall-clock timeout and the fix-loop cap leave a terminal status. A dispatch that has not started is cancelled. A running dispatch becomes `needs_reconciliation` (`halted_while_running`) and is not marked completed or run again. `POST /internal/fix-loop/next` still returns a `decideFixLoop` decision for debugging; the loop is what applies it.
+
+`execution_mode` defaults to `simulation`. Simulation CP3 is `needs_human` with `simulation_not_success`, never `succeeded`. `succeeded` requires `execution_mode=live`, `runs.commit_sha`, a `run_evidence` artifact for that sha, and a `verified` pass of every gate in `org_config.required_checks` for that same sha, plus CP3. A missing configured check fails closed. An empty `required_checks` also fails closed. This PR does not produce live evidence.
+
+The worker does not run a job when `DATABASE_URL` is unset. Recovery does not enqueue a dispatch whose run is expired, cancelled, or otherwise not active. The worker's claim checks the same durable status and deadline before the stub handler. A `running` row whose heartbeat is older than `GB_DISPATCH_STALE_SECONDS` (default 30) becomes `needs_reconciliation` (`crash_after_running`) and the run becomes `needs_human`. If the handler has started and the run is then halted or its deadline passes, the outbox stays `needs_reconciliation` with `halted_while_running` or `external_effect_unknown`. Finish reports `completed` only when it updates a still-active `running` row. A later halt, stale-heartbeat pass, or completion attempt does not replace that cause or rerun the job. None of these records mean an external call was stopped.
+
+Gate results inside the run are placeholders. GitHub CI on this repo is also not a substitute for those run gates: `reviewer` passes only because `GATE_STUB=1`, `acceptance` matches a fixture, `sast` is a regex plus `pnpm audit`, `load` hammers gateway `/health` for two seconds, and `load-staging` / `e2e` are lab stubs. None of them execute the change request.
+
+Worker (`apps/worker`) consumes BullMQ queue `jobs`. Handlers accept the payload (`v`, `name`, `runId`, `requestId`, `iteration`, `role`, `requestText`) and ack a stub result. They do not call a model.
+
+| Env | Role |
+|---|---|
+| `DATABASE_URL` | Postgres. Unset → loop idle, health stays up |
+| `REDIS_URL` | BullMQ. Unset → jobs complete inside the orchestrator and are **not** handed to the worker |
+| `ORCHESTRATOR_POLL_MS` | Poll interval, default `2000` |
+| `ORCHESTRATOR_LEASE_SECONDS` | Claim lease, default `30`. Not bumped on `runs.version` |
+| `ORCHESTRATOR_BATCH` | Runs per tick, default `10` |
+| `GB_AGENT_ESTIMATE_USD` | Reservation per dispatch. `0` or unset refuses the dispatch (`unbudgeted_estimate`) |
+| `GB_GATES_FAIL` | Comma-separated gate names the stub runner fails, for lab fix-loop checks |
+| `PORT` | HTTP port, default `3001` orchestrator / `3003` worker |
+
+`GET /health` on the orchestrator reports `mode: "lifecycle"`, `queue` (`off` | `inline` | `bullmq`), and `lastError` (for example a missing `003_run_phase.sql`).
 
 ## Credits (section 7b)
 

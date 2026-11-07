@@ -9,14 +9,30 @@ import {
   createRunTool,
   getRunTool,
 } from "../src/mcp/tools.js";
+import { defaultLabOrgConfig } from "@gb/credits";
+import { signHumanJwt } from "../src/mcp/human-auth.js";
 import { InMemoryRunStore } from "../src/store/memory.js";
 import { createRunStoreFromEnv } from "../src/store/index.js";
 import { nextCheckpoint, stageFor } from "../src/store/workflow.js";
 
+const FIXTURE_KEY = "hmac-fixture-key";
+
+let store: InMemoryRunStore;
 let ctx: ToolContext;
 
+function humanHeader(authTime = Math.floor(Date.now() / 1000)): string {
+  return `Bearer ${signHumanJwt(FIXTURE_KEY, { sub: "human-fixture", authTime, exp: authTime + 600 })}`;
+}
+
 beforeEach(() => {
-  ctx = { store: new InMemoryRunStore(), principal: "bearer:test", ip: "127.0.0.1" };
+  store = new InMemoryRunStore();
+  ctx = {
+    store,
+    principal: "bearer:test",
+    ip: "127.0.0.1",
+    humanAuthorization: humanHeader(),
+    humanAuth: { secret: FIXTURE_KEY, maxAgeSeconds: 300, agentCredential: "agent-token" },
+  };
 });
 
 async function newRunId(): Promise<string> {
@@ -38,6 +54,7 @@ describe("create_run", () => {
   it("creates an active run awaiting CP1", async () => {
     const out = await createRunTool({ request: "  add a /status page  " }, ctx);
     expect(out.status).toBe("active");
+    expect(out.phase).toBe("queued");
     expect(out.stage).toBe("awaiting_cp1");
     expect(typeof out.runId).toBe("string");
     const run = await ctx.store.getRun(String(out.runId));
@@ -73,23 +90,98 @@ describe("get_run", () => {
 });
 
 describe("approve", () => {
-  it("advances CP1 -> CP2 -> CP3 and closes the run as succeeded", async () => {
+  it("rejects the agent credential as a human approver", async () => {
     const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
+    const denied = await callTool(
+      "approve",
+      { runId, checkpoint: "CP1" },
+      {
+        ...ctx,
+        humanAuthorization: "Bearer agent-token",
+      },
+    );
+    expect(denied.structuredContent.error).toBe("human_auth_invalid");
+    const missing = await callTool(
+      "approve",
+      { runId, checkpoint: "CP1" },
+      {
+        ...ctx,
+        humanAuthorization: null,
+      },
+    );
+    expect(missing.structuredContent.error).toBe("human_auth_required");
+    expect((await store.getRun(runId))?.approvals).toEqual([]);
+  });
+
+  it("rejects a stale human reauthentication", async () => {
+    const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
+    const stale = await callTool(
+      "approve",
+      { runId, checkpoint: "CP1" },
+      {
+        ...ctx,
+        humanAuthorization: `Bearer ${signHumanJwt(FIXTURE_KEY, {
+          sub: "human-fixture",
+          authTime: Math.floor(Date.now() / 1000) - 3600,
+          exp: Math.floor(Date.now() / 1000) + 600,
+        })}`,
+      },
+    );
+    expect(stale.structuredContent.error).toBe("human_auth_stale");
+  });
+
+  it("rejects a checkpoint before the orchestrator is waiting on it", async () => {
+    const runId = await newRunId();
+    const res = await callTool("approve", { runId, checkpoint: "CP1" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent.error).toBe("not_ready");
+    const run = await store.getRun(runId);
+    expect(run?.status).toBe("active");
+    expect(run?.phase).toBe("queued");
+    expect(run?.approvals).toEqual([]);
+  });
+
+  it("advances CP1 -> CP2 -> CP3 only at the matching phase and then succeeds", async () => {
+    const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
 
     const cp1 = await approveTool({ runId, checkpoint: "CP1", comment: "plan ok" }, ctx);
     expect(cp1.stage).toBe("awaiting_cp2");
     expect(cp1.status).toBe("active");
 
+    const earlyCp2 = await callTool("approve", { runId, checkpoint: "CP2" }, ctx);
+    expect(earlyCp2.structuredContent.error).toBe("not_ready");
+
+    store.setPhase(runId, "awaiting_cp2");
     const cp2 = await approveTool({ runId, checkpoint: "CP2" }, ctx);
     expect(cp2.stage).toBe("awaiting_cp3");
+    expect(cp2.status).toBe("active");
 
+    store.setPhase(runId, "awaiting_cp3");
     const cp3 = await approveTool({ runId, checkpoint: "CP3" }, ctx);
     expect(cp3.stage).toBe("approved");
-    expect(cp3.status).toBe("succeeded");
+    expect(cp3.status).toBe("needs_human");
+    expect((await store.getRun(runId))?.phaseReason).toBe("simulation_not_success");
+
+    const liveId = await newRunId();
+    store.setPhase(liveId, "awaiting_cp1");
+    await approveTool({ runId: liveId, checkpoint: "CP1" }, ctx);
+    store.setPhase(liveId, "awaiting_cp2");
+    await approveTool({ runId: liveId, checkpoint: "CP2" }, ctx);
+    store.setPhase(liveId, "awaiting_cp3");
+    store.setLiveEvidence(liveId, {
+      commitSha: "abc123",
+      requiredGates: defaultLabOrgConfig().requiredChecks,
+    });
+    const live = await approveTool({ runId: liveId, checkpoint: "CP3" }, ctx);
+    expect(live.status).toBe("succeeded");
 
     const run = await ctx.store.getRun(runId);
     expect(run?.approvals.map((a) => a.checkpoint)).toEqual(["CP1", "CP2", "CP3"]);
-    expect(run?.approvals[0]?.userId).toBe("bearer:test");
+    expect(run?.approvals[0]?.userId).toBe("human-fixture");
+    expect(run?.approvals[0]?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(run?.approvals[0]?.comment).toBe("plan ok");
     expect(run?.endedAt).not.toBeNull();
     expect(run?.version).toBe(4);
@@ -104,6 +196,7 @@ describe("approve", () => {
 
   it("rejects a duplicate approval", async () => {
     const runId = await newRunId();
+    store.setPhase(runId, "awaiting_cp1");
     await approveTool({ runId, checkpoint: "CP1" }, ctx);
     const res = await callTool("approve", { runId, checkpoint: "CP1" }, ctx);
     expect(res.structuredContent.error).toBe("already_approved");

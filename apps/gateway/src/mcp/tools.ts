@@ -1,11 +1,14 @@
 import { type RunRecord, type RunStore, RunStoreError } from "../store/types.js";
 import { CHECKPOINT_ORDER, isCheckpoint } from "../store/workflow.js";
+import { HumanAuthError, type HumanAuthConfig, verifyHumanAuthorization } from "./human-auth.js";
 
 export interface ToolContext {
   store: RunStore;
-  /** Authenticated caller; recorded as approvals.user_id. */
+  /** Agent principal. Never written as the human approver. */
   principal: string;
   ip?: string | null;
+  humanAuthorization?: string | null;
+  humanAuth?: HumanAuthConfig;
 }
 
 export interface ToolDefinition {
@@ -57,7 +60,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "approve",
     title: "Approve checkpoint",
     description:
-      "Record a human approval for the run's next checkpoint (CP1, then CP2, then CP3). Approving CP3 marks the run succeeded.",
+      "Record a human approval only when X-GB-Human-Authorization carries a fresh human JWT and the orchestrator is waiting on that checkpoint: CP1 at awaiting_cp1, CP2 at awaiting_cp2, CP3 at awaiting_cp3. The agent bearer cannot approve. CP3 sets succeeded only when live same-commit artifact and verified gate evidence exist; simulation stays needs_human.",
     inputSchema: {
       type: "object",
       properties: {
@@ -106,7 +109,13 @@ export const createRunTool: ToolHandler = async (args, ctx) => {
     throw new ToolInputError(`request must be at most ${MAX_REQUEST_CHARS} characters`);
   }
   const run = await ctx.store.createRun({ request });
-  return { runId: run.runId, status: run.status, stage: run.stage, requestId: run.requestId };
+  return {
+    runId: run.runId,
+    status: run.status,
+    stage: run.stage,
+    phase: run.phase,
+    requestId: run.requestId,
+  };
 };
 
 export const getRunTool: ToolHandler = async (args, ctx) => {
@@ -127,10 +136,16 @@ export const approveTool: ToolHandler = async (args, ctx) => {
   if (comment !== undefined && typeof comment !== "string") {
     throw new ToolInputError("comment must be a string");
   }
+  const human = verifyHumanAuthorization(
+    ctx.humanAuthorization,
+    ctx.humanAuth ?? { maxAgeSeconds: 300 },
+  );
+  if (!human.ok) throw new HumanAuthError(human.code, human.message);
   const run = await ctx.store.approve({
     runId,
     checkpoint,
-    userId: ctx.principal,
+    userId: human.userId,
+    authTime: human.authTime.toISOString(),
     comment: comment ?? null,
     ip: ctx.ip ?? null,
   });
@@ -163,9 +178,16 @@ export async function callTool(name: string, args: unknown, ctx: ToolContext): P
       isError: false,
     };
   } catch (err) {
-    if (err instanceof ToolInputError || err instanceof RunStoreError) {
+    if (
+      err instanceof ToolInputError ||
+      err instanceof RunStoreError ||
+      err instanceof HumanAuthError
+    ) {
       const error = {
-        error: err instanceof RunStoreError ? err.code : "invalid_arguments",
+        error:
+          err instanceof RunStoreError || err instanceof HumanAuthError
+            ? err.code
+            : "invalid_arguments",
         message: err.message,
       };
       return {

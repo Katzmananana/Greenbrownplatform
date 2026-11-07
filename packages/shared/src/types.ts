@@ -11,6 +11,25 @@ export type RunStatus =
   | "cancelled"
   | "live";
 
+/**
+ * Orchestrator lifecycle. This is not the gateway checkpoint stage
+ * (`awaiting_cp1` … `approved`), which is derived only from approvals.
+ * `status` stays `active` until CP3 is approved at `awaiting_cp3`, which is only
+ * reached after planning, coding, and gates. Earlier checkpoints do not close the run.
+ */
+export const RUN_PHASES = [
+  "queued",
+  "planning",
+  "awaiting_cp1",
+  "coding",
+  "gates",
+  "fixing",
+  "awaiting_cp2",
+  "awaiting_cp3",
+] as const;
+
+export type RunPhase = (typeof RUN_PHASES)[number];
+
 export type ProjectKind = "green" | "brown";
 
 export interface ModelRef {
@@ -62,6 +81,9 @@ export interface Run {
   version: number;
   startedAt: string;
   endedAt: string | null;
+  /** Present once migration 003 is applied and a reader selects it. */
+  phase?: RunPhase;
+  phaseReason?: string | null;
 }
 
 export type GateName =

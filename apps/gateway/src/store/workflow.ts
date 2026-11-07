@@ -1,4 +1,10 @@
-import type { Checkpoint, RunStatus } from "@gb/shared";
+import {
+  PHASE_FOR_CHECKPOINT,
+  phaseAcceptsCheckpoint,
+  type Checkpoint,
+  type RunPhase,
+  type RunStatus,
+} from "@gb/shared";
 import { type RunStage, RunStoreError } from "./types.js";
 
 export const CHECKPOINT_ORDER: readonly Checkpoint[] = ["CP1", "CP2", "CP3"];
@@ -29,7 +35,12 @@ export function stageFor(approved: Iterable<Checkpoint>): RunStage {
  * and only while the run is still active.
  */
 export function assertCanApprove(
-  run: { runId: string; status: RunStatus; approved: Iterable<Checkpoint> },
+  run: {
+    runId: string;
+    status: RunStatus;
+    phase: RunPhase;
+    approved: Iterable<Checkpoint>;
+  },
   checkpoint: Checkpoint,
 ): void {
   const approved = new Set(run.approved);
@@ -52,9 +63,25 @@ export function assertCanApprove(
       `cannot approve ${checkpoint} for run ${run.runId}; next checkpoint is ${expected ?? "none"}`,
     );
   }
+  if (!phaseAcceptsCheckpoint(run.phase, checkpoint)) {
+    const required = PHASE_FOR_CHECKPOINT[checkpoint];
+    throw new RunStoreError(
+      "not_ready",
+      `cannot approve ${checkpoint} for run ${run.runId}; orchestrator phase is ${run.phase}, required ${required}`,
+    );
+  }
 }
 
-/** CP3 is the last human gate: approving it closes the run as succeeded. */
-export function statusAfterApproval(current: RunStatus, checkpoint: Checkpoint): RunStatus {
-  return checkpoint === "CP3" ? "succeeded" : current;
+/**
+ * CP1 and CP2 leave the run active. CP3 becomes succeeded only when the caller
+ * has already proved live execution plus same-commit evidence. Otherwise the
+ * human decision is recorded and the run stops as needs_human, not succeeded.
+ */
+export function statusAfterApproval(
+  current: RunStatus,
+  checkpoint: Checkpoint,
+  success: boolean,
+): RunStatus {
+  if (checkpoint !== "CP3") return current;
+  return success ? "succeeded" : "needs_human";
 }

@@ -1,8 +1,16 @@
 import type { Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp, type GatewayOptions } from "../src/app.js";
+import { signHumanJwt } from "../src/mcp/human-auth.js";
+import { InMemoryRunStore } from "../src/store/memory.js";
 
 const TOKEN = "lab-test-token";
+const FIXTURE_KEY = "hmac-fixture-key";
+
+function humanHeader(): string {
+  const authTime = Math.floor(Date.now() / 1000);
+  return `Bearer ${signHumanJwt(FIXTURE_KEY, { sub: "human-fixture", authTime, exp: authTime + 600 })}`;
+}
 
 let server: Server | undefined;
 
@@ -41,8 +49,21 @@ async function rpc(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-async function tool(url: string, name: string, args: unknown): Promise<any> {
-  const { status, body } = await rpc(url, "tools/call", { name, arguments: args });
+async function tool(
+  url: string,
+  name: string,
+  args: unknown,
+  headers: Record<string, string> = {},
+): Promise<any> {
+  const { status, body } = await rpc(
+    url,
+    "tools/call",
+    { name, arguments: args },
+    {
+      authorization: `Bearer ${TOKEN}`,
+      ...headers,
+    },
+  );
   expect(status).toBe(200);
   return body.result.structuredContent;
 }
@@ -67,8 +88,12 @@ describe("MCP over HTTP", () => {
     expect(res.status).toBe(200);
   });
 
-  it("initialize, tools/list, then create_run -> approve CP1..CP3 -> get_run", async () => {
-    const url = await start();
+  it("initialize, tools/list, then create_run -> approve only when the phase is ready", async () => {
+    const store = new InMemoryRunStore();
+    const url = await start({
+      runStore: store,
+      humanAuth: { secret: FIXTURE_KEY, maxAgeSeconds: 300, agentCredential: TOKEN },
+    });
 
     const init = await rpc(url, "initialize", {
       protocolVersion: "2025-06-18",
@@ -87,15 +112,37 @@ describe("MCP over HTTP", () => {
 
     const created = await tool(url, "create_run", { request: "add a /status page" });
     expect(created.status).toBe("active");
+    expect(created.phase).toBe("queued");
     const { runId } = created;
 
-    for (const checkpoint of ["CP1", "CP2", "CP3"]) {
-      const approved = await tool(url, "approve", { runId, checkpoint });
+    const agentOnly = await tool(url, "approve", { runId, checkpoint: "CP1" });
+    expect(agentOnly.error).toBe("human_auth_required");
+    const tooSoon = await tool(
+      url,
+      "approve",
+      { runId, checkpoint: "CP1" },
+      { "x-gb-human-authorization": humanHeader() },
+    );
+    expect(tooSoon.error).toBe("not_ready");
+
+    for (const [phase, checkpoint] of [
+      ["awaiting_cp1", "CP1"],
+      ["awaiting_cp2", "CP2"],
+      ["awaiting_cp3", "CP3"],
+    ] as const) {
+      store.setPhase(runId, phase);
+      const approved = await tool(
+        url,
+        "approve",
+        { runId, checkpoint },
+        { "x-gb-human-authorization": humanHeader() },
+      );
       expect(approved.checkpoint).toBe(checkpoint);
     }
 
     const run = await tool(url, "get_run", { runId });
-    expect(run.status).toBe("succeeded");
+    expect(run.status).toBe("needs_human");
+    expect(run.phaseReason).toBe("simulation_not_success");
     expect(run.stage).toBe("approved");
     expect(run.request).toBe("add a /status page");
     expect(run.approvals).toHaveLength(3);

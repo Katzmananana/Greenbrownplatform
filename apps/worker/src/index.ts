@@ -1,34 +1,57 @@
 import { Worker } from "bullmq";
 import express from "express";
+import { JOB_QUEUE_NAME, bullmqConnectionFromUrl, type AgentJobPayload } from "@gb/shared";
+import { executeQueuedJob } from "./complete.js";
 
 const port = Number(process.env.PORT ?? 3003);
-const redisUrl = process.env.REDIS_URL;
+const redisUrl = process.env.REDIS_URL?.trim() || undefined;
 
-function redisConnection(urlStr: string) {
-  const u = new URL(urlStr);
-  return {
-    host: u.hostname,
-    port: Number(u.port || 6379),
-    password: u.password ? decodeURIComponent(u.password) : undefined,
-    username: u.username ? decodeURIComponent(u.username) : undefined,
+const databaseUrl = process.env.DATABASE_URL?.trim() || undefined;
+let dispatchDb: { query(text: string, params?: unknown[]): Promise<{ rows: any[] }> } | undefined;
+if (databaseUrl) {
+  const moduleName = "pg";
+  const mod = (await import(moduleName)) as {
+    default?: {
+      Pool?: new (config: { connectionString: string; max?: number }) => {
+        query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+      };
+    };
+    Pool?: new (config: { connectionString: string; max?: number }) => {
+      query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+    };
   };
+  const Pool = mod.default?.Pool ?? mod.Pool;
+  if (Pool) dispatchDb = new Pool({ connectionString: databaseUrl, max: 2 });
 }
 
-let worker: Worker | undefined;
-if (redisUrl) {
-  worker = new Worker(
-    "jobs",
+let worker: Worker<AgentJobPayload> | undefined;
+if (redisUrl && !dispatchDb) {
+  console.error(
+    JSON.stringify({
+      msg: "worker fail-closed: REDIS_URL is set but DATABASE_URL is missing; jobs are not executed",
+      queue: JOB_QUEUE_NAME,
+    }),
+  );
+} else if (redisUrl && dispatchDb) {
+  const db = dispatchDb;
+  worker = new Worker<AgentJobPayload>(
+    JOB_QUEUE_NAME,
     async (job) => {
-      console.log(JSON.stringify({ msg: "worker stub handled job", name: job.name, id: job.id }));
-      return { ok: true, stub: true, name: job.name };
+      const done = await executeQueuedJob(db, job.name, job.data);
+      if (!done.executed) {
+        throw new Error(done.reason ?? "not_executed");
+      }
+      return done.result;
     },
-    { connection: redisConnection(redisUrl) },
+    { connection: bullmqConnectionFromUrl(redisUrl) },
   );
   worker.on("error", (err) => {
     console.error(JSON.stringify({ msg: "worker error", error: err.message }));
   });
 } else {
-  console.log(JSON.stringify({ msg: "worker stub: REDIS_URL unset, HTTP health only" }));
+  console.log(
+    JSON.stringify({ msg: "REDIS_URL unset; worker HTTP health only", queue: JOB_QUEUE_NAME }),
+  );
 }
 
 const app = express();
@@ -39,6 +62,8 @@ const health = (_req: express.Request, res: express.Response): void => {
     service: "worker",
     platform: "akshi-green-brown",
     redis: Boolean(redisUrl),
+    durable: Boolean(dispatchDb),
+    queue: JOB_QUEUE_NAME,
     time: new Date().toISOString(),
   });
 };
@@ -47,7 +72,14 @@ app.get("/healthz", health);
 app.get("/readyz", health);
 
 const server = app.listen(port, () => {
-  console.log(JSON.stringify({ msg: "worker listening", port, redis: Boolean(redisUrl) }));
+  console.log(
+    JSON.stringify({
+      msg: "worker listening",
+      port,
+      redis: Boolean(redisUrl),
+      queue: JOB_QUEUE_NAME,
+    }),
+  );
 });
 
 async function shutdown(signal: string): Promise<void> {

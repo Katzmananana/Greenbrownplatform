@@ -1,4 +1,4 @@
-import type { Checkpoint, RunStatus } from "@gb/shared";
+import type { Checkpoint, ExecutionMode, RunPhase, RunStatus } from "@gb/shared";
 
 /** Where a run sits in the CP1 → CP2 → CP3 human-checkpoint sequence. */
 export type RunStage = "awaiting_cp1" | "awaiting_cp2" | "awaiting_cp3" | "approved";
@@ -16,6 +16,11 @@ export interface RunRecord {
   requestId: string;
   request: string | null;
   status: RunStatus;
+  /** Orchestrator lifecycle. Distinct from `stage`, which is the next human checkpoint. */
+  phase: RunPhase;
+  phaseReason: string | null;
+  executionMode: ExecutionMode;
+  commitSha: string | null;
   stage: RunStage;
   iteration: number;
   version: number;
@@ -32,6 +37,8 @@ export interface ApproveInput {
   runId: string;
   checkpoint: Checkpoint;
   userId: string;
+  /** Verified human `auth_time`. The store must persist this value, not now(). */
+  authTime: string;
   comment?: string | null;
   ip?: string | null;
 }
@@ -48,7 +55,9 @@ export type RunStoreErrorCode =
   | "not_found"
   | "out_of_order"
   | "already_approved"
-  | "run_not_active";
+  | "run_not_active"
+  | "not_ready"
+  | "human_auth_required";
 
 export class RunStoreError extends Error {
   readonly code: RunStoreErrorCode;

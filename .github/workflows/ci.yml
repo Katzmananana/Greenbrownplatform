@@ -163,6 +163,49 @@ jobs:
       - name: Record fix-loop retry cap from org_config
         run: node scripts/gates/fix-loop.mjs
 
+  safety-integration:
+    name: safety-integration
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gb
+          POSTGRES_PASSWORD: gb
+          POSTGRES_DB: gb_safety
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gb -d gb_safety"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      GB_REQUIRE_SAFETY_INTEGRATION: "1"
+      GB_TEST_DATABASE_URL: postgresql://gb:gb@localhost:5432/gb_safety
+      GB_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @gb/shared build && pnpm --filter @gb/credits build && pnpm --filter @gb/gates build
+      - name: Postgres and Redis safety suite
+        run: pnpm --filter @gb/orchestrator exec vitest run test/safety.integration.test.ts
+
   gates-required:
     name: gates-required
     needs:
@@ -177,7 +220,8 @@ jobs:
       - load
       - load-staging
       - fix-loop
+      - safety-integration
     runs-on: ubuntu-latest
     steps:
-      - name: All §7 blocking gates passed
-        run: echo "lint typecheck unit functional e2e reviewer acceptance sast load load-staging fix-loop — all green"
+      - name: All §7 blocking gates and the safety integration suite passed
+        run: echo "lint typecheck unit functional e2e reviewer acceptance sast load load-staging fix-loop safety-integration — all green"
