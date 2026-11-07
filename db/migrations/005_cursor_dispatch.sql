@@ -34,5 +34,16 @@ ALTER TABLE cursor_dispatch ADD CONSTRAINT cursor_dispatch_launch_check
 
 COMMENT ON TABLE cursor_dispatch IS
   'Durable Cursor Cloud Agents v1 identity for one outbox row. commit_sha stays null unless a documented response field carries it. Get A Run git.branches has repoUrl, branch, and prUrl only.';
+ALTER TABLE cursor_dispatch ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+ALTER TABLE cursor_dispatch ADD COLUMN IF NOT EXISTS cancel_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE cursor_dispatch ADD COLUMN IF NOT EXISTS next_reconcile_at timestamptz;
+ALTER TABLE cursor_dispatch ADD COLUMN IF NOT EXISTS cancel_closed boolean NOT NULL DEFAULT false;
+
 COMMENT ON COLUMN cursor_dispatch.cancel_confirmed IS
   'True only after Get A Run returns CANCELLED. A cancel POST by itself does not confirm the remote run stopped.';
+COMMENT ON COLUMN cursor_dispatch.cancel_requested IS
+  'Set for intent, launched, and unknown handles when the local run must not continue. A late create still saves the provider ids and does not call create again.';
+COMMENT ON COLUMN cursor_dispatch.cancel_closed IS
+  'Stops further cancel HTTP. The row stays visible. Closed is not the same as confirmed.';
+COMMENT ON COLUMN cursor_dispatch.next_reconcile_at IS
+  'Next bounded status/cancel attempt. Independent of the local run still being active.';

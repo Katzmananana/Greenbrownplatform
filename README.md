@@ -104,7 +104,7 @@ The worker does not run a job when `DATABASE_URL` is unset. Recovery does not en
 
 Gate results inside the run are placeholders. GitHub CI on this repo is also not a substitute for those run gates: `reviewer` passes only because `GATE_STUB=1`, `acceptance` matches a fixture, `sast` is a regex plus `pnpm audit`, `load` hammers gateway `/health` for two seconds, and `load-staging` / `e2e` are lab stubs. None of them execute the change request.
 
-Worker (`apps/worker`) consumes BullMQ queue `jobs`. Plan jobs still ack a stub. `code` and `fix` jobs call Cursor Cloud Agents API v1 only when `GB_CURSOR_EXECUTOR=1`. Otherwise they stay on the stub. The adapter does not set `execution_mode=live`, does not write `run_evidence`, and does not turn a run into `succeeded`.
+Worker (`apps/worker`) consumes BullMQ queue `jobs`. Plan jobs still ack a stub. `code` and `fix` stay on the stub unless `GB_CURSOR_EXECUTOR=1` and `GB_CURSOR_API_BASE` is a loopback mock. The public Cursor API host is refused: the documented API has no per-run USD cap, so the adapter is not production-enabled for paid execution. It does not set `execution_mode=live`, does not write `run_evidence`, and does not turn a run into `succeeded`.
 
 The documented API is `https://api.cursor.com` (`POST /v1/agents`, `GET /v1/agents/{id}`, `GET /v1/agents/{id}/runs/{runId}`, `POST /v1/agents/{id}/runs/{runId}/cancel`). A client `agentId` (`bc-` plus a UUID derived from the dispatch key) is sent so a repeat create returns `409 agent_id_conflict` instead of a second agent. There is no documented `Idempotency-Key` header. A timeout or 5xx after the intent row is stored becomes `needs_reconciliation` and is not posted again. `GET /v1/agents/{id}/usage` reports tokens after the fact and is not a USD cap. This repo's credit ledger is a local reservation only. The create call does not send a model id and does not enforce a provider spend limit. Claude Code subscription credits are not Cursor API funds, and this adapter does not call Anthropic.
 
@@ -112,13 +112,13 @@ The documented API is `https://api.cursor.com` (`POST /v1/agents`, `GET /v1/agen
 
 | Env | Role |
 |---|---|
-| `GB_CURSOR_EXECUTOR` | Unset leaves code jobs on the stub. `1` enables the adapter. Any other value fails closed |
-| `CURSOR_API_KEY` or `GB_CURSOR_API_KEY` | Cursor Dashboard API key. Do not commit it. Required when the executor is on |
+| `GB_CURSOR_EXECUTOR` | Unset leaves code jobs on the stub. `1` allows a loopback mock only. Any other value fails closed |
+| `CURSOR_API_KEY` or `GB_CURSOR_API_KEY` | Cursor Dashboard API key. Do not commit it. A key does not enable a paid launch |
 | `GB_CURSOR_REPO_URL` | Must be exactly the approved Greenbrownplatform repository. Any other URL, including TalentFit, is refused |
 | `GB_CURSOR_STARTING_REF` | Branch name sent as `startingRef`. Default `main`. Not a commit SHA |
-| `GB_CURSOR_API_BASE` | Default `https://api.cursor.com`. `http` is accepted only for `127.0.0.1` or `localhost` mocks |
+| `GB_CURSOR_API_BASE` | Loopback (`127.0.0.1` or `localhost`) is the mock. `https://api.cursor.com` is refused with `cursor_spend_cap_absent` |
 
-A launch also requires a non-empty `runs.plan_text`, an approved CP1, and a positive local org/run budget (`max_cost_usd`, `max_cost_usd_per_run`, and the dispatch `cost_usd`). Apply `db/migrations/005_cursor_dispatch.sql` before enabling the executor. The next live test is not this suite: one human-approved launch, with a real Cursor API key, against that one repository, after the user says to spend. It still will not prove `succeeded`.
+A mock launch also requires a non-empty `runs.plan_text`, an approved CP1, an active run inside `deadline_at` re-checked immediately before create, and a positive local org/run budget. That local estimate is not a provider cap. Apply `db/migrations/005_cursor_dispatch.sql` before the mock path. A real launch stays blocked until Cursor documents a per-run USD limit this process can enforce. Account spend limits are billing-cycle and not instant. `GET /v1/agents/{id}/usage` and SDK `getUsage()` report tokens or cents after the fact.
 
 | Env | Role |
 |---|---|

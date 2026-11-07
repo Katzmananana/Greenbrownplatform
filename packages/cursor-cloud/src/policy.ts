@@ -101,6 +101,28 @@ export type CursorExecutorConfig =
       startingRef: string;
     };
 
+/**
+ * Cloud Agents create has no per-run USD field. Account spend limits are
+ * billing-cycle controls and the docs say enforcement is not instant.
+ * Usage and SDK cost reads report spend after the fact. None of those is a
+ * cap this process can set or check before a launch. There is no env flag
+ * that turns a real launch on.
+ */
+export function isLoopbackApiBase(apiBase: string): boolean {
+  try {
+    const url = new URL(apiBase);
+    return url.hostname === "127.0.0.1" || url.hostname === "localhost";
+  } catch {
+    return false;
+  }
+}
+
+export function interpretCancelStatus(status: string): "confirmed" | "too_late" | "pending" {
+  if (status === "CANCELLED") return "confirmed";
+  if (status === "FINISHED" || status === "ERROR" || status === "EXPIRED") return "too_late";
+  return "pending";
+}
+
 export function readCursorExecutorConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): CursorExecutorConfig {
@@ -128,6 +150,9 @@ export function readCursorExecutorConfig(
   }
   if (base.protocol === "http:" && base.hostname !== "127.0.0.1" && base.hostname !== "localhost") {
     return { mode: "refused", reason: "cursor_api_base" };
+  }
+  if (!isLoopbackApiBase(base.origin)) {
+    return { mode: "refused", reason: "cursor_spend_cap_absent" };
   }
   return {
     mode: "ready",

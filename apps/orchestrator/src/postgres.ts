@@ -12,6 +12,7 @@ import type { CreditLedgerStore } from "@gb/credits";
 import { defaultLabOrgConfig } from "@gb/credits";
 import {
   cancelCursorRuns as cancelCursorRunsSql,
+  reconcileCursorCancels as reconcileCursorCancelsSql,
   syncCursorDispatch as syncCursorDispatchSql,
 } from "./cursor-sync.js";
 import { configFromOrgRow, ledgerFromSums, type SpendSums } from "./credits.js";
@@ -459,6 +460,10 @@ export class PostgresRunRepository implements RunRepository {
 
   async cancelCursorRuns(runId: string, client: CursorCloudClient | null): Promise<void> {
     await cancelCursorRunsSql(this.pool, runId, client);
+  }
+
+  async reconcileCursorCancels(client: CursorCloudClient | null, limit: number): Promise<number> {
+    return reconcileCursorCancelsSql(this.pool, client, limit);
   }
 
   async haltRun(prev: RunSnapshot, patch: RunPatch): Promise<"ok" | "conflict"> {

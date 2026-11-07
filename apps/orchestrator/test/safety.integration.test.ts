@@ -1515,4 +1515,248 @@ describe.skipIf(!databaseUrl || !redisUrl)("safety integration (postgres + redis
       await mock.close();
     }
   });
+
+  it("saves a late create after local halt and pursues cancel without a second create", async () => {
+    await reset();
+    let release: () => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let creates = 0;
+    let cancels = 0;
+    const mock = await mockCursor(async (req, body) => {
+      if (req.method === "POST" && req.url === "/v1/agents") {
+        creates += 1;
+        await opened;
+        const agentId = String((body as { agentId?: string }).agentId);
+        return {
+          status: 200,
+          body: {
+            agent: {
+              id: agentId,
+              latestRunId: "run-late",
+              url: `https://cursor.com/agents/${agentId}`,
+            },
+            run: { id: "run-late", agentId, status: "CREATING" },
+          },
+        };
+      }
+      if (req.method === "POST" && req.url?.endsWith("/cancel")) {
+        cancels += 1;
+        return { status: 200, body: { id: "run-late" } };
+      }
+      return {
+        status: 200,
+        body: { id: "run-late", agentId: "bc-late", status: "CANCELLED" },
+      };
+    });
+    try {
+      const seeded = await seedCoding("late create");
+      const pending = executeCursorCodingJob(
+        pool,
+        seeded.key,
+        seeded.payload,
+        mock.executor.config,
+        mock.executor.client,
+      );
+      await waitUntil(async () => creates === 1);
+      await pool.query(
+        `UPDATE runs SET status = 'needs_human', phase_reason = 'wall_clock' WHERE id = $1`,
+        [seeded.run.runId],
+      );
+      await pool.query(
+        `UPDATE cursor_dispatch SET cancel_requested = true WHERE idempotency_key = $1`,
+        [seeded.key],
+      );
+      release();
+      const done = await pending;
+      expect(done.disposition).toBe("terminal");
+      expect(creates).toBe(1);
+      expect(cancels).toBe(1);
+      const handle = await cursorRow(seeded.key);
+      expect(handle.agent_id).toBeTruthy();
+      expect(handle.provider_run_id).toBe("run-late");
+      expect(handle.cancel_confirmed).toBe(true);
+      expect(handle.provider_status).toBe("CANCELLED");
+      expect(handle.launch).toBe("launched");
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("does not call Cursor when the deadline has already passed", async () => {
+    await reset();
+    const mock = await mockCursor(() => {
+      throw new Error("provider must not be called");
+    });
+    try {
+      const seeded = await seedCoding("already expired");
+      await pool.query(`UPDATE runs SET deadline_at = now() - interval '1 second' WHERE id = $1`, [
+        seeded.run.runId,
+      ]);
+      const done = await executeCursorCodingJob(
+        pool,
+        seeded.key,
+        seeded.payload,
+        mock.executor.config,
+        mock.executor.client,
+      );
+      expect(done).toMatchObject({ disposition: "refused", reason: "cursor_not_runnable" });
+      expect(mock.posts).toBe(0);
+      const handle = await cursorRow(seeded.key);
+      expect(handle.cancel_requested).toBe(true);
+      expect(
+        (await pool.query(`SELECT status FROM runs WHERE id = $1`, [seeded.run.runId])).rows[0]
+          ?.status,
+      ).toBe("needs_human");
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("retries cancel after the local run is terminal, including a process restart", async () => {
+    await reset();
+    let cancelFailures = 1;
+    let creates = 0;
+    let cancelPosts = 0;
+    let statusReads = 0;
+    const mock = await mockCursor((req) => {
+      if (req.method === "POST" && req.url === "/v1/agents") {
+        creates += 1;
+        return { status: 500, body: { code: "unavailable" } };
+      }
+      if (req.method === "POST" && req.url?.endsWith("/cancel")) {
+        cancelPosts += 1;
+        if (cancelFailures > 0) {
+          cancelFailures -= 1;
+          return { status: 503, body: { code: "unavailable" } };
+        }
+        return { status: 200, body: { id: "run-retry" } };
+      }
+      statusReads += 1;
+      return {
+        status: 200,
+        body: { id: "run-retry", agentId: "bc-retry", status: "CANCELLED" },
+      };
+    });
+    try {
+      const run = await store.createRun({ request: "restart cancel" });
+      await pool.query(
+        `UPDATE runs SET phase = 'coding', status = 'needs_human', phase_reason = 'wall_clock' WHERE id = $1`,
+        [run.runId],
+      );
+      const key = agentJobId({ name: "code", runId: run.runId, iteration: 0 });
+      await pool.query(
+        `INSERT INTO dispatch_outbox
+           (idempotency_key, org_id, run_id, request_id, job_name, role, iteration, payload, cost_usd, state, executions)
+         VALUES ($1, $2::uuid, $3, $4, 'code', 'coder', 0, '{}'::jsonb, 1, 'needs_reconciliation', 1)`,
+        [key, ORG, run.runId, run.requestId],
+      );
+      await pool.query(
+        `INSERT INTO cursor_dispatch
+           (idempotency_key, run_id, intended_agent_id, agent_id, provider_run_id, launch, cancel_requested)
+         VALUES ($1, $2, 'bc-retry', 'bc-retry', 'run-retry', 'launched', true)`,
+        [key, run.runId],
+      );
+      expect(await repo.reconcileCursorCancels(mock.executor.client, 5)).toBe(1);
+      let handle = await cursorRow(key);
+      expect(handle.cancel_confirmed).toBe(false);
+      expect(handle.reconciliation).toBe("cursor_cancel_unconfirmed");
+      expect(Number(handle.cancel_attempts)).toBe(1);
+      expect(
+        (await pool.query(`SELECT status FROM runs WHERE id = $1`, [run.runId])).rows[0]?.status,
+      ).toBe("needs_human");
+      await pool.query(
+        `UPDATE cursor_dispatch SET next_reconcile_at = now() - interval '1 second' WHERE idempotency_key = $1`,
+        [key],
+      );
+      await runTick({
+        repo,
+        jobs,
+        now: new Date(),
+        leaseSeconds: 5,
+        batchSize: 10,
+        estimateUsd: 1,
+        staleSeconds: 30,
+        cursor: mock.executor.client,
+      });
+      handle = await cursorRow(key);
+      expect(handle.cancel_confirmed).toBe(true);
+      expect(handle.provider_status).toBe("CANCELLED");
+      expect(creates).toBe(0);
+      expect(cancelPosts).toBe(2);
+      expect(statusReads).toBe(1);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("records a finished or failed provider run when cancel is too late", async () => {
+    await reset();
+    const mock = await mockCursor((req) => {
+      if (req.method === "POST" && req.url?.endsWith("/cancel")) {
+        return { status: 409, body: { code: "run_not_cancellable" } };
+      }
+      const finished = req.url?.includes("run-done");
+      return {
+        status: 200,
+        body: {
+          id: finished ? "run-done" : "run-bad",
+          agentId: "bc-late-status",
+          status: finished ? "FINISHED" : "ERROR",
+          result: finished ? "mock finished after halt" : "mock failed after halt",
+          git: finished
+            ? {
+                branches: [
+                  {
+                    repoUrl: "github.com/Katzmananana/Greenbrownplatform",
+                    branch: "cursor/too-late",
+                    prUrl: "https://github.com/Katzmananana/Greenbrownplatform/pull/11",
+                  },
+                ],
+              }
+            : undefined,
+        },
+      };
+    });
+    try {
+      const run = await store.createRun({ request: "too late" });
+      await pool.query(
+        `UPDATE runs SET phase = 'coding', status = 'needs_human', phase_reason = 'wall_clock' WHERE id = $1`,
+        [run.runId],
+      );
+      for (const [suffix, providerRun] of [
+        ["done", "run-done"],
+        ["bad", "run-bad"],
+      ] as const) {
+        const key = `${suffix}.${run.runId}.0`;
+        await pool.query(
+          `INSERT INTO cursor_dispatch
+             (idempotency_key, run_id, intended_agent_id, agent_id, provider_run_id, launch, cancel_requested)
+           VALUES ($1, $2, $3, $3, $4, 'launched', true)`,
+          [key, run.runId, `bc-${suffix}`, providerRun],
+        );
+      }
+      await repo.reconcileCursorCancels(mock.executor.client, 5);
+      const done = await cursorRow(`done.${run.runId}.0`);
+      const bad = await cursorRow(`bad.${run.runId}.0`);
+      expect(done.cancel_confirmed).toBe(false);
+      expect(done.provider_status).toBe("FINISHED");
+      expect(done.reconciliation).toBe("cursor_cancel_too_late_FINISHED");
+      expect(done.branch).toBe("cursor/too-late");
+      expect(done.cancel_closed).toBe(true);
+      expect(bad.cancel_confirmed).toBe(false);
+      expect(bad.provider_status).toBe("ERROR");
+      expect(bad.reconciliation).toBe("cursor_cancel_too_late_ERROR");
+      const postsBefore = mock.posts;
+      await repo.reconcileCursorCancels(mock.executor.client, 5);
+      expect(mock.posts).toBe(postsBefore);
+      expect((await cursorRow(`done.${run.runId}.0`)).cancel_confirmed).toBe(false);
+      expect(
+        (await pool.query(`SELECT status FROM runs WHERE id = $1`, [run.runId])).rows[0]?.status,
+      ).toBe("needs_human");
+    } finally {
+      await mock.close();
+    }
+  });
 });

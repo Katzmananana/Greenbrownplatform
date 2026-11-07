@@ -53,8 +53,13 @@ export interface RunRepository {
     client: CursorCloudClient | null,
     staleSeconds: number,
   ): Promise<"absent" | "active" | "completed" | "reconciled">;
-  /** Ask Cursor to cancel a launched run. Does not claim the call was stopped. */
+  /** Ask Cursor to cancel. Does not claim the call was stopped. */
   cancelCursorRuns(runId: string, client: CursorCloudClient | null): Promise<void>;
+  /**
+   * Retry cancel/status for handles whose local run may already be terminal.
+   * Never creates an agent. Returns how many due rows were visited.
+   */
+  reconcileCursorCancels(client: CursorCloudClient | null, limit: number): Promise<number>;
   /**
    * Terminal halt. Dispatches that have not started are cancelled. A running
    * dispatch becomes needs_reconciliation with cause halted_while_running.
@@ -331,6 +336,10 @@ export class MemoryRunRepository implements RunRepository {
   }
 
   async cancelCursorRuns(): Promise<void> {}
+
+  async reconcileCursorCancels(): Promise<number> {
+    return 0;
+  }
 
   async reconcileStaleRunning(
     idempotencyKey: string,

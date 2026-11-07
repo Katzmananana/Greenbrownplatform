@@ -39,6 +39,7 @@ export interface TickDeps {
  */
 export async function runTick(deps: TickDeps): Promise<TickStats> {
   const stats: TickStats = { claimed: 0, saved: 0, conflicts: 0, enqueued: 0, errors: 0 };
+  await deps.repo.reconcileCursorCancels(deps.cursor ?? null, 5);
   const config = await deps.repo.loadConfig();
   const claimed = await deps.repo.claimDue(deps.batchSize, deps.leaseSeconds, deps.now);
   stats.claimed = claimed.length;

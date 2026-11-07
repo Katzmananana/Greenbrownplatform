@@ -3,6 +3,8 @@ import {
   buildCreateAgentBody,
   classifyRunStatus,
   cursorAgentIdForDispatch,
+  interpretCancelStatus,
+  isLoopbackApiBase,
   readProviderGit,
   type CursorCloudClient,
   type CursorExecutorConfig,
@@ -24,8 +26,13 @@ export type CodingDisposition =
 /**
  * Launch or resume one code/fix dispatch against Cursor Cloud Agents v1.
  * A missing config, credential, allowlist, plan, CP1 approval, or positive
- * local budget never calls the network. An ambiguous create is stored and
- * is not posted again. Git repo, branch, and PR URL are copied only from the
+ * local budget never calls the network. A positive local estimate is not a
+ * provider spend cap: any non-loopback API base is refused before HTTP.
+ * Loopback is a mock only. An ambiguous create is stored and is not posted
+ * again. A deadline or inactive run is re-read immediately before create.
+ * If cancel was requested while create was in flight, the response ids are
+ * saved and cancel is pursued; create is not called again. Git repo, branch,
+ * and PR URL are copied only from the
  * provider payload, and only when the repo is the allowlisted one.
  * `commit_sha` is left null: Get A Run does not document a commit field.
  * This does not set `execution_mode` or write `run_evidence`.
@@ -40,6 +47,9 @@ export async function executeCursorCodingJob(
   if (config.mode === "off") return { disposition: "refused", reason: "cursor_executor_off" };
   if (config.mode === "refused") return refuse(db, idempotencyKey, payload, config.reason);
   if (!client) return refuse(db, idempotencyKey, payload, "cursor_credential_missing");
+  if (!isLoopbackApiBase(config.apiBase)) {
+    return refuse(db, idempotencyKey, payload, "cursor_spend_cap_absent");
+  }
 
   const gate = await loadGate(db, idempotencyKey);
   if (!gate.ok) return refuse(db, idempotencyKey, payload, gate.reason);
@@ -69,9 +79,23 @@ export async function executeCursorCodingJob(
     await db.query(
       `INSERT INTO cursor_dispatch
          (idempotency_key, run_id, intended_agent_id, launch)
-       VALUES ($1, $2::uuid, $3, 'intent')`,
+       VALUES ($1, $2::uuid, $3, 'intent')
+       ON CONFLICT (idempotency_key) DO NOTHING`,
       [idempotencyKey, payload.runId, intended],
     );
+  }
+  const runnable = await runAllowsCreate(db, idempotencyKey, payload.runId);
+  if (!runnable) {
+    await db.query(
+      `UPDATE cursor_dispatch
+       SET cancel_requested = true,
+           reconciliation = COALESCE(reconciliation, 'cursor_not_runnable'),
+           updated_at = now()
+       WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    await settle(db, idempotencyKey, payload.runId, "cursor_not_runnable");
+    return { disposition: "refused", reason: "cursor_not_runnable" };
   }
 
   const body = buildCreateAgentBody({
@@ -86,6 +110,16 @@ export async function executeCursorCodingJob(
   try {
     const created = await client.createAgent(body);
     await rememberLaunch(db, idempotencyKey, created.agent.id, created.run.id, created.agent.url);
+    if (await cancelWasRequested(db, idempotencyKey)) {
+      return honorCancelAfterCreate(
+        db,
+        idempotencyKey,
+        payload.runId,
+        created.agent.id,
+        created.run.id,
+        client,
+      );
+    }
     return applyRun(db, idempotencyKey, payload.runId, created.run, client);
   } catch (err) {
     if (err instanceof CursorCloudError && err.kind === "conflict") {
@@ -112,6 +146,9 @@ async function adoptExisting(
       return { disposition: "ambiguous", reason: "cursor_launch_conflict_no_run" };
     }
     await rememberLaunch(db, idempotencyKey, agent.id, agent.latestRunId, agent.url);
+    if (await cancelWasRequested(db, idempotencyKey)) {
+      return honorCancelAfterCreate(db, idempotencyKey, runId, agent.id, agent.latestRunId, client);
+    }
     const run = await client.getRun(agent.id, agent.latestRunId);
     return applyRun(db, idempotencyKey, runId, run, client);
   } catch (err) {
@@ -231,6 +268,95 @@ async function markAmbiguous(
     [idempotencyKey, reason],
   );
   await settle(db, idempotencyKey, runId, reason);
+}
+
+async function runAllowsCreate(
+  db: Queryable,
+  idempotencyKey: string,
+  runId: string,
+): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT r.status, r.deadline_at, c.cancel_requested
+     FROM runs r
+     LEFT JOIN cursor_dispatch c ON c.idempotency_key = $2
+     WHERE r.id = $1::uuid`,
+    [runId, idempotencyKey],
+  );
+  const row = rows[0];
+  if (!row || row.status !== "active" || row.cancel_requested === true) return false;
+  if (row.deadline_at != null && new Date(row.deadline_at).getTime() <= Date.now()) return false;
+  return true;
+}
+
+async function cancelWasRequested(db: Queryable, idempotencyKey: string): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT cancel_requested FROM cursor_dispatch WHERE idempotency_key = $1`,
+    [idempotencyKey],
+  );
+  return rows[0]?.cancel_requested === true;
+}
+
+async function honorCancelAfterCreate(
+  db: Queryable,
+  idempotencyKey: string,
+  runId: string,
+  agentId: string,
+  providerRunId: string,
+  client: CursorCloudClient,
+): Promise<CodingDisposition> {
+  let observed: CursorRun | null = null;
+  try {
+    await client.cancelRun(agentId, providerRunId);
+    observed = await client.getRun(agentId, providerRunId);
+  } catch (err) {
+    if (
+      err instanceof CursorCloudError &&
+      err.kind === "conflict" &&
+      err.code === "run_not_cancellable"
+    ) {
+      try {
+        observed = await client.getRun(agentId, providerRunId);
+      } catch {
+        observed = null;
+      }
+    }
+  }
+  if (!observed) {
+    await db.query(
+      `UPDATE cursor_dispatch
+       SET cancel_requested = true,
+           cancel_confirmed = false,
+           reconciliation = 'cursor_cancel_unconfirmed',
+           next_reconcile_at = now(),
+           updated_at = now()
+       WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    await settle(db, idempotencyKey, runId, "cursor_cancel_unconfirmed");
+    return { disposition: "ambiguous", reason: "cursor_cancel_unconfirmed" };
+  }
+  const verdict = interpretCancelStatus(observed.status);
+  const reason =
+    verdict === "confirmed"
+      ? "cursor_cancel_confirmed"
+      : verdict === "too_late"
+        ? `cursor_cancel_too_late_${observed.status}`
+        : "cursor_cancel_unconfirmed";
+  await db.query(
+    `UPDATE cursor_dispatch
+     SET provider_status = $2,
+         cancel_requested = true,
+         cancel_confirmed = $3,
+         cancel_closed = $4,
+         reconciliation = $5,
+         updated_at = now()
+     WHERE idempotency_key = $1`,
+    [idempotencyKey, observed.status, verdict === "confirmed", verdict !== "pending", reason],
+  );
+  await settle(db, idempotencyKey, runId, reason);
+  if (verdict === "confirmed") return { disposition: "terminal", reason };
+  if (verdict === "too_late") return { disposition: "terminal", reason };
+  return { disposition: "ambiguous", reason };
 }
 
 async function rememberLaunch(

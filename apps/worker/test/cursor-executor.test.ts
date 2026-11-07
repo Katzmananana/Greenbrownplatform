@@ -46,12 +46,15 @@ describe("cursor cloud agents contract (mocked, not a live launch)", () => {
         CURSOR_API_KEY: "test-key",
         GB_CURSOR_REPO_URL: APPROVED_CURSOR_REPOSITORY,
       }),
-    ).toMatchObject({
-      mode: "ready",
-      repoUrl: APPROVED_CURSOR_REPOSITORY,
-      startingRef: "main",
-      apiBase: "https://api.cursor.com",
-    });
+    ).toMatchObject({ mode: "refused", reason: "cursor_spend_cap_absent" });
+    expect(
+      readCursorExecutorConfig({
+        GB_CURSOR_EXECUTOR: "1",
+        CURSOR_API_KEY: "test-key",
+        GB_CURSOR_REPO_URL: APPROVED_CURSOR_REPOSITORY,
+        GB_CURSOR_API_BASE: "http://127.0.0.1:9",
+      }),
+    ).toMatchObject({ mode: "ready", apiBase: "http://127.0.0.1:9" });
   });
 
   it("builds a documented create body and does not send a model or envVars", () => {
